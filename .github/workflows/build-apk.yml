@@ -16,6 +16,9 @@ jobs:
           java-version: "17"
           distribution: temurin
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install SDK
         run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
       - uses: gradle/actions/setup-gradle@v4
@@ -50,3 +53,4 @@ jobs:
         with:
           name: ui-test-results
           path: test-results/
+
