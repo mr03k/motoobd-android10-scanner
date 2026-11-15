@@ -1,63 +1,46 @@
-# MotoOBD Telemetry Pro — Android 10 Bluetooth OBD-II ECU Scanner & Live Dashboard
+# MotoOBD
 
-A self-contained **OBD-II Bluetooth ECU Diagnostic Scanner & Live Telemetry Cockpit** engineered for **Android 10 (API Level 29)**. It supports both **Bluetooth Classic SPP (RFCOMM)** and **Web Bluetooth (BLE 4.0+)** ELM327 adapters to display real-time ECU connection status, read and clear Diagnostic Trouble Codes (DTCs) with clickable online interpretations, and monitor live engine telemetry and sensor health.
+An Android 8+ app for reading supported OBD-II telemetry and diagnostic trouble codes from a paired ELM-compatible Bluetooth adapter. Android 10 is supported. The Android host uses Kotlin and a bundled, offline WebView interface.
 
----
+## Use
 
-## 1. Repository Structure
+1. Pair the adapter in Android Bluetooth settings, then open MotoOBD while stationary.
+2. Choose **Connect**, refresh paired devices, select the adapter and connect. Android 12+ asks for Nearby devices permission.
+3. View measured values in **Live** and read stored, pending and permanent codes in **Faults**. Unsupported or stale values appear unavailable. Sampling is sequential and is not a high-rate data logger.
+4. Clearing codes requires explicit confirmation and a positive ECU response. It can erase freeze frames and reset readiness monitors; permanent codes cannot be cleared with Mode 04.
 
-```text
-motoobd-android10-scanner/
-├── README.md                          # Project overview, setup & Android 10 usage guide
-├── HANDOFF.md                         # Engineering architecture, PID/DTC specs & handoff guide
-├── push_to_github.ps1                 # Windows PowerShell one-click GitHub push script
-├── push_to_github.sh                  # Linux/macOS Bash one-click GitHub push script
-├── web/
-│   └── obd2_diagnostic_app.html       # Self-contained HTML5/JS/Tailwind/Chart.js Web App
-└── app/                               # Native Android 10 (API 29) Kotlin WebView + SPP Host
-    ├── build.gradle                   # Android Gradle config (compileSdk 29 / targetSdk 29)
-    └── src/main/
-        ├── AndroidManifest.xml        # Android 10 Bluetooth & Fine Location permissions
-        ├── assets/index.html          # Embedded MotoOBD Telemetry Pro cockpit UI
-        └── java/com/motoobd/scanner/
-            └── MainActivity.kt        # Native RFCOMM BluetoothSocket (00001101-...) bridge
+The standalone HTML is an offline UI/demo preview. Real hardware access requires the Android APK. Demo is clearly labeled and never writes to an ECU. Generic DTC references are guidance, not a diagnosis. This app does not measure compression, invent freeze frames, or infer cylinder/sensor health from ordinary OBD polling.
+
+## Build and checks
+
+Install JDK 17 (JDK 21 also works locally), Android SDK platform 35 and build tools 34.0.0. Set `ANDROID_HOME`, or create an ignored `local.properties` with `sdk.dir=/path/to/sdk`.
+
+```sh
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
----
+On Windows use `gradlew.bat`. The wrapper pins Gradle 8.9 with SHA-256 verification; AGP 8.7.3 and Kotlin 2.0.21 are pinned. Compile SDK is 35, target SDK is 34, minimum SDK is 26. The target remains unchanged to avoid introducing Android 15 edge-to-edge behavior during this refactor. This is a sideload/debug app, not a Play Store release.
 
-## 2. Core Features & Grounded Standards
+APK: `app/build/outputs/apk/debug/app-debug.apk` (debug signed). No release signing keys are included.
 
-1. **Bluetooth OBD-II & ECU Link State Machine**:
-   - **ELM327 Initialization Sequence**: Executes `ATZ` (Reset), `ATE0` (Echo Off), `ATL0` (Linefeeds Off), and `ATSP0` (Automatic Protocol Detection — defaults to `ISO 15765-4 CAN 11-bit 500 kbaud` on ECU address `0x7E8`) per [BlueDriver ELM327 Protocol Notes](https://github.com/sjalkote/bluedriver-reverse-engineering) and [Zbotic ELM327 AT Command Guide](https://zbotic.in/obd-ii-elm327-read-car-diagnostic-codes-with-arduino/).
-   - **Dual Transport Support on Android 10**:
-     - **Web Bluetooth BLE**: Connects directly in Chrome on Android 10 to BLE 4.0+ adapters via GATT service UUIDs `0000fff0-0000-1000-8000-00805f9b34fb` and `0000ffe0-0000-1000-8000-00805f9b34fb`.
-     - **Classic Bluetooth SPP (RFCOMM)**: Connects via `MainActivity.kt` (`AndroidObdBridge`) using standard Serial Port Profile UUID `00001101-0000-1000-8000-00805F9B34FB`.
+```sh
+npm ci
+npx playwright install chromium
+npm test
+```
 
-2. **Live Dashboard ([SAE J1979 Mode 01 PIDs](https://en.wikipedia.org/wiki/OBD-II_PIDs))**:
-   - **Vehicle Speed (`PID 010D`)**: Radial gauge + peak tracker (`A` km/h, `0–255 km/h`, with Metric/Imperial toggle).
-   - **Engine Speed (`PID 010C`)**: Radial tachometer + crankshaft stability indicator (`(256*A + B) / 4` RPM).
-   - **Control Module / Battery Voltage (`PID 0142` & `ATRV`)**: Live alternator charging check (`(256*A + B) / 1000` V) and minimum cranking sag tracker.
-   - **Water / Engine Coolant Temperature (`PID 0105`)**: Live thermistor readout (`A - 40` °C) and closed-loop thermostat status.
-   - **Intake Air Temperature (`PID 010F`)**: Live intake temperature (`A - 40` °C) paired with Mass Air Flow (`PID 0110`, `(256*A + B) / 100` g/s).
-   - **Compression & Manifold Vacuum (`PID 010B` & `PID 0133`)**: Real-time Intake Manifold Absolute Pressure (`A` kPa), Barometric Pressure (`A` kPa), calculated manifold vacuum (`MAP - Baro`), and 4-cylinder relative compression balance.
-   - **Sensors Health Overview**: Real-time validation across 8 primary engine management sensors and `PID 0101` readiness monitors.
+UI tests use mocked native bridge responses, with phone/tablet screenshots and error-path checks. To use installed Chrome locally: `PLAYWRIGHT_CHANNEL=chrome npm test` (PowerShell: `$env:PLAYWRIGHT_CHANNEL='chrome'; npm test`). CI runs native unit tests, lint, build and UI checks on pushes/PRs.
 
-3. **Fault Code Reader, Mode 04 Reset & Clickable Online Interpretations**:
-   - **Read Faults (`Mode 03` Stored / `Mode 07` Pending / `Mode 0A` Permanent)**: Decodes 2-byte CAN trouble frames using [SAE J2012 bitwise rules](https://www.csselectronics.com/pages/obd-trouble-code-dtc-lookup-converter-tool) (`00=P`, `01=C`, `10=B`, `11=U`).
-   - **Clear Faults (`Mode 04`)**: Includes an in-app confirmation modal warning that `Mode 04` extinguishes the Check Engine Light (MIL), erases `Mode 02` freeze frames, and resets `PID 0101` readiness monitors.
-   - **Clickable Fault Cards**: Tapping any fault (`P0171`, `P0302`, `P0420`, `P0300`, `P0118`, `P0562`, `P0113`, `P0135`, `P0101`, `P0122`, `P0174`, `U0100`, or any custom searched code) opens a diagnostic drawer displaying the ECU trigger threshold, `Mode 02` Freeze Frame snapshot, common symptoms, probable causes, repair steps, and direct links to [AUTODOC OBD-II Club](https://club.autodoc.co.uk/obd-codes/p0171), [CSS Electronics](https://www.csselectronics.com/pages/obd-trouble-code-dtc-lookup-converter-tool), [CarAdvise](https://caradvise.com/simple-guide-to-the-check-engine-light/), and [TroubleshootYourVehicle](https://troubleshootyourvehicle.com/tools/obd-ii-error-code-lookup).
+## Source map
 
-4. **Electronic Relative Compression & Vacuum Analyzer**:
-   - Evaluates cylinder-to-cylinder mechanical compression balance without removing spark plugs by measuring starter cranking RPM drop (`PID 010C`), battery voltage sag (`PID 0142`), and intake manifold vacuum pulses (`PID 010B`) per [Pico Technology Compression Testing](https://www.picoauto.com/library/picoscope-automotive-training/training/compression-testing-by-pico-technology) and [Autoditex Relative Compression Analysis](https://autoditex.com/page/relative-compression-test-67-1.html).
+- `app/src/main/java/com/motoobd/scanner/MainActivity.kt`: WebView host, permissions, serial ELM worker, Classic/BLE transport and lifecycle cancellation.
+- `app/src/main/java/com/motoobd/scanner/ObdParser.kt`: pure JVM ELM payload/PID/DTC parser.
+- `app/src/main/assets/index.html`: bundled UI; `web/obd2_diagnostic_app.html` must match byte-for-byte (tested).
+- `HANDOFF.md`: contracts and validation limits.
+- `docs/REVIEW.md`: review findings and changes.
 
----
+Legacy `deploy_*`, `fix_*`, and push scripts are retired stubs. Earlier versions overwrote source or deleted Git history. Use the wrapper to build and ordinary Git branch/commit/push commands to publish.
 
-## 3. Running on Android 10 (API Level 29)
+## Hardware limits
 
-Per [Android Developers Bluetooth Permissions Documentation](https://developer.android.com/develop/connectivity/bluetooth/bt-permissions), Android 10 requires:
-1. **Manifest Permissions**: `BLUETOOTH`, `BLUETOOTH_ADMIN`, `ACCESS_FINE_LOCATION` (upgraded from coarse location in API 29), and `ACCESS_BACKGROUND_LOCATION` if scanning in background services.
-2. **Hardware GPS Toggle**: Android 10 requires the phone's system **Location (GPS) switch** to be turned **ON** during Bluetooth discovery/scanning.
-3. **Pairing the OBD-II Reader**:
-   - Plug the ELM327 adapter into the vehicle's 16-pin SAE J1962 port and turn the ignition key to **ON / RUN**.
-   - Open **Android 10 Settings → Connected devices → Pair new device**, select `OBDII` or `ELM327`, and enter PIN `1234` or `0000`.
-   - Open the app, tap **Configure BT**, and select **Scan BLE OBD** (for BLE 4.0+ adapters in Chrome) or **Handshake ECU** (via the native Android 10 Kotlin APK).
+No adapter or vehicle was available during the refactor. Classic/BLE compatibility, permission prompts on real Android 10/12+ devices, ECU timing, ignition-off behavior, and physical disconnect/reconnect remain field tests. BLE supports paired adapters exposing supported serial services and notifications; pairing/discovery happens in Android settings. Some BLE-only adapters cannot be paired that way and are not supported by this version.

@@ -1,665 +1,480 @@
 package com.motoobd.scanner
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.BluetoothSocket
+import android.bluetooth.*
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.InputStream
-import java.io.OutputStream
+import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
+import java.util.concurrent.atomic.AtomicLong
 
+/** All ELM commands run on one serial worker. The UI only reads caches or queues operations. */
 class MainActivity : Activity() {
     private lateinit var webView: WebView
-    private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
+    private val adapter: BluetoothAdapter? by lazy { getSystemService(BluetoothManager::class.java)?.adapter }
+    private val worker = Executors.newSingleThreadScheduledExecutor()
+    private val watchdog = Executors.newSingleThreadScheduledExecutor()
+    private val generation = AtomicLong()
     private val ioLock = Any()
-
-    private var btSocket: BluetoothSocket? = null
-    private var outStream: OutputStream? = null
-    private var inStream: InputStream? = null
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var bleWriteChar: BluetoothGattCharacteristic? = null
-    @Volatile private var lastBleResponse: String = ""
-
-    @Volatile private var pollingActive: Boolean = false
-    @Volatile private var cachedTelemetryJson: String = "{}"
-    private var pollThread: Thread? = null
-
-    @Volatile private var liveSpeed: Int = 0
-    @Volatile private var liveRpm: Int = 0
-    @Volatile private var liveVoltage: Double = 13.8
-    @Volatile private var liveVoltMin: Double = 13.8
-    @Volatile private var liveCoolant: Int = 85
-    @Volatile private var liveIntake: Int = 30
-    @Volatile private var liveMap: Int = 35
-    @Volatile private var liveBaro: Int = 101
-    @Volatile private var liveThrottle: Double = 14.0
-    @Volatile private var liveLoad: Double = 20.0
-    @Volatile private var liveMaf: Double = 2.8
-    @Volatile private var liveStft: Double = 0.0
-    @Volatile private var liveO2B1S1: Double = 0.45
-    @Volatile private var liveO2B1S2: Double = 0.65
+    private val sessionLock = Any()
+    private val responseLock = Object()
+    private val bleResponse = StringBuilder()
+    @Volatile private var socket: BluetoothSocket? = null
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    @Volatile private var writeLatch: CountDownLatch? = null
+    @Volatile private var setupLatch: CountDownLatch? = null
+    @Volatile private var writeSucceeded = false
+    @Volatile private var state = "disconnected"
+    @Volatile private var deviceLabel = ""
+    @Volatile private var lastError = ""
+    @Volatile private var destroyed = false
+    @Volatile private var foreground = false
+    @Volatile private var countedDtcs = false
+    private var tick = 0
+    private data class Reading(val value: Double, val at: Long = System.currentTimeMillis())
+    private val readings = ConcurrentHashMap<String, Reading>()
 
     companion object {
-        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-        private const val REQ_BT_PERMS = 1001
+        private val SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
+        private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val ASSET_URL = "file:///android_asset/index.html"
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestBluetoothPermissions()
         webView = WebView(this)
         setContentView(webView)
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            textZoom = 100
+            allowFileAccess = false
+            allowContentAccess = false
+            blockNetworkLoads = true
+            setSupportMultipleWindows(false)
         }
-        webView.webViewClient = WebViewClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = routeUrl(request.url)
+            @Deprecated("Compatibility with older WebViews")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean = routeUrl(Uri.parse(url))
+        }
         webView.webChromeClient = WebChromeClient()
         webView.addJavascriptInterface(ObdBridge(), "AndroidObdBridge")
-        webView.loadUrl("file:///android_asset/index.html")
+        webView.loadUrl(ASSET_URL)
+        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf("android.permission.BLUETOOTH_CONNECT", "android.permission.BLUETOOTH_SCAN"), 1001)
+        }
+        worker.scheduleWithFixedDelay({
+            if (state == "connected") {
+                val token = generation.get()
+                try { pollTelemetry() } catch (e: Exception) { failConnection(e.message ?: "Adapter disconnected", token) }
+            }
+        }, 250, 250, TimeUnit.MILLISECONDS)
+    }
+
+    private fun routeUrl(uri: Uri): Boolean {
+        if (uri.toString().substringBefore('#') == ASSET_URL) return false
+        if (uri.scheme == "https" || uri.scheme == "http") {
+            try { startActivity(Intent(Intent.ACTION_VIEW, uri)) } catch (_: Exception) { }
+        }
+        return true
+    }
+
+    override fun onStart() {
+        super.onStart()
+        foreground = true
+    }
+
+    override fun onStop() {
+        foreground = false
+        disconnect()
+        super.onStop()
     }
 
     override fun onDestroy() {
-        pollingActive = false
-        closeActiveSocketCleanly()
+        destroyed = true
+        disconnect()
+        worker.shutdownNow()
+        watchdog.shutdownNow()
+        webView.removeJavascriptInterface("AndroidObdBridge")
+        webView.destroy()
         super.onDestroy()
     }
 
-    private fun requestBluetoothPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val perms = mutableListOf<String>()
-            if (Build.VERSION.SDK_INT >= 31) {
-                perms.add("android.permission.BLUETOOTH_SCAN")
-                perms.add("android.permission.BLUETOOTH_CONNECT")
-            } else {
-                perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
-                perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
-                perms.add(Manifest.permission.BLUETOOTH)
-                perms.add(Manifest.permission.BLUETOOTH_ADMIN)
-            }
-            val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-            if (missing.isNotEmpty()) {
-                requestPermissions(missing.toTypedArray(), REQ_BT_PERMS)
-            }
+    private fun requireBluetooth() {
+        if (adapter == null) throw IOException("This device has no Bluetooth adapter.")
+        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
+            throw IOException("Allow Nearby devices permission in Android Settings, then try again.")
         }
+        if (adapter?.isEnabled != true) throw IOException("Turn on Bluetooth in Android Settings.")
     }
 
-    private fun closeActiveSocketCleanly() {
-        pollingActive = false
-        synchronized(ioLock) {
-            try { inStream?.close() } catch (_: Exception) {}
-            try { outStream?.close() } catch (_: Exception) {}
-            try { btSocket?.close() } catch (_: Exception) {}
-            inStream = null
-            outStream = null
-            btSocket = null
-            try { bluetoothGatt?.close() } catch (_: Exception) {}
-            bluetoothGatt = null
-            bleWriteChar = null
+    @SuppressLint("MissingPermission")
+    private fun closeTransport() {
+        val oldSocket = socket
+        socket = null
+        val oldGatt = gatt
+        gatt = null
+        writeCharacteristic = null
+        try { oldSocket?.close() } catch (_: Exception) { }
+        try { oldGatt?.disconnect(); oldGatt?.close() } catch (_: Exception) { }
+        writeLatch?.countDown()
+        setupLatch?.countDown()
+        synchronized(responseLock) { responseLock.notifyAll() }
+    }
+
+    private fun disconnect() = synchronized(sessionLock) {
+        generation.incrementAndGet()
+        state = "disconnected"
+        lastError = ""
+        deviceLabel = ""
+        closeTransport()
+        readings.clear()
+        countedDtcs = false
+    }
+
+    private fun failConnection(error: String, token: Long = generation.get()) = synchronized(sessionLock) {
+        if (generation.get() != token || state == "disconnected") return@synchronized
+        disconnect()
+        lastError = error
+        state = "error"
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun command(cmd: String, timeout: Long = 1200): String {
+        val token = generation.get()
+        try { return exchange(cmd, timeout) } catch (e: Exception) {
+            failConnection(e.message ?: "Adapter communication failed.", token)
+            throw e
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun sendElmCommandInternal(cmd: String, timeoutMs: Long = 700L): String {
-        synchronized(ioLock) {
-            val gatt = bluetoothGatt
-            val wChar = bleWriteChar
-            if (gatt != null && wChar != null) {
-                return try {
-                    lastBleResponse = ""
-                    wChar.value = (cmd.trim() + "\r").toByteArray(Charsets.US_ASCII)
-                    gatt.writeCharacteristic(wChar)
-                    val start = System.currentTimeMillis()
-                    while (System.currentTimeMillis() - start < timeoutMs) {
-                        if (lastBleResponse.contains(">")) break
-                        Thread.sleep(15)
-                    }
-                    lastBleResponse.replace(">", "").trim()
-                } catch (e: Exception) {
-                    "ERR:${e.message}"
-                }
+    private fun exchange(cmd: String, timeout: Long): String = synchronized(ioLock) {
+        val request = (cmd.trim() + "\r").toByteArray(Charsets.US_ASCII)
+        val activeGatt = gatt
+        val characteristic = writeCharacteristic
+        val deadline = SystemClock.elapsedRealtime() + timeout
+        if (activeGatt != null && characteristic != null) {
+            synchronized(responseLock) { bleResponse.setLength(0) }
+            for (chunk in request.asList().chunked(20)) {
+                val latch = CountDownLatch(1)
+                writeLatch = latch
+                writeSucceeded = false
+                characteristic.writeType = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                characteristic.value = chunk.toByteArray()
+                if (!activeGatt.writeCharacteristic(characteristic)) throw IOException("Bluetooth write was rejected.")
+                if (!latch.await(timeout, TimeUnit.MILLISECONDS) || !writeSucceeded) throw IOException("Bluetooth write timed out.")
+                writeLatch = null
             }
-
-            val out = outStream ?: return "NO_SOCKET"
-            val inp = inStream ?: return "NO_SOCKET"
-            return try {
-                while (inp.available() > 0) {
-                    val dump = ByteArray(128)
-                    inp.read(dump)
+            synchronized(responseLock) {
+                while (!bleResponse.contains(">")) {
+                    if (gatt !== activeGatt) throw IOException("Adapter disconnected.")
+                    val remaining = deadline - SystemClock.elapsedRealtime()
+                    if (remaining <= 0) throw IOException("Adapter did not finish its reply. Reconnect and retry.")
+                    responseLock.wait(remaining)
                 }
-                out.write((cmd.trim() + "\r").toByteArray(Charsets.US_ASCII))
-                out.flush()
-                val buffer = StringBuilder()
-                val byteBuf = ByteArray(256)
-                val start = System.currentTimeMillis()
-                while (System.currentTimeMillis() - start < timeoutMs) {
-                    if (inp.available() > 0) {
-                        val readLen = inp.read(byteBuf)
-                        if (readLen > 0) {
-                            val chunk = String(byteBuf, 0, readLen, Charsets.US_ASCII)
-                            buffer.append(chunk)
-                            if (chunk.contains(">")) break
-                        }
-                    } else {
-                        Thread.sleep(12)
-                    }
-                }
-                buffer.toString().replace(">", "").trim()
-            } catch (e: Exception) {
-                "ERR:${e.message}"
+                bleResponse.toString().substringBefore('>').trim()
             }
+        } else {
+            val activeSocket = socket ?: throw IOException("Connect an adapter first.")
+            val input = activeSocket.inputStream
+            val output = activeSocket.outputStream
+            output.write(request)
+            output.flush()
+            val response = StringBuilder()
+            val bytes = ByteArray(256)
+            var complete = false
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (socket !== activeSocket) throw IOException("Adapter disconnected.")
+                val available = input.available()
+                if (available > 0) {
+                    val size = input.read(bytes, 0, minOf(available, bytes.size))
+                    if (size < 0) throw IOException("Adapter disconnected.")
+                    response.append(String(bytes, 0, size, Charsets.US_ASCII))
+                    if (response.length > 32768) throw IOException("Adapter reply is too large.")
+                    if (response.contains(">")) { complete = true; break }
+                } else Thread.sleep(10)
+            }
+            if (!complete) throw IOException("Adapter did not finish its reply. Reconnect and retry.")
+            response.toString().substringBefore('>').trim()
         }
     }
 
-    private fun extractVoltageNumber(raw: String): Double? {
-        val m = Regex("([0-9]+[.][0-9]+)").find(raw)
-        return m?.groupValues?.getOrNull(1)?.toDoubleOrNull()
-    }
-
-    private fun parsePidBytes(resp: String, modeHex: String, pidHex: String): List<Int>? {
-        if (resp.isEmpty() || resp.contains("NO DATA", true) || resp.contains("ERROR", true) || resp.contains("UNABLE", true)) {
-            return null
-        }
-        val clean = resp.replace(Regex("[^0-9A-Fa-f]"), "").uppercase()
-        val target = (modeHex + pidHex).uppercase()
-        val idx = clean.indexOf(target)
-        if (idx < 0) return null
-        val after = clean.substring(idx + target.length)
-        val out = mutableListOf<Int>()
-        var i = 0
-        while (i + 1 < after.length) {
-            val b = after.substring(i, i + 2).toIntOrNull(16) ?: break
-            out.add(b)
-            i += 2
-        }
-        return if (out.isEmpty()) null else out
-    }
-
-    private fun startBackgroundTelemetryWorker() {
-        pollingActive = true
-        if (pollThread?.isAlive == true) return
-        pollThread = Thread {
-            var tick = 0
-            while (pollingActive) {
-                try {
-                    val rRpm = sendElmCommandInternal("010C", 450L)
-                    parsePidBytes(rRpm, "41", "0C")?.let { b ->
-                        if (b.size >= 2) liveRpm = ((b[0] * 256) + b[1]) / 4
-                    }
-
-                    val rSpd = sendElmCommandInternal("010D", 450L)
-                    parsePidBytes(rSpd, "41", "0D")?.let { b ->
-                        if (b.isNotEmpty()) liveSpeed = b[0]
-                    }
-
-                    when (tick % 4) {
-                        0 -> {
-                            val rVolt = sendElmCommandInternal("ATRV", 400L)
-                            extractVoltageNumber(rVolt)?.let { v ->
-                                if (v > 5.0) {
-                                    liveVoltage = v
-                                    if (liveVoltMin == 0.0 || v < liveVoltMin) liveVoltMin = v
-                                }
-                            }
-                            val rMap = sendElmCommandInternal("010B", 400L)
-                            parsePidBytes(rMap, "41", "0B")?.firstOrNull()?.let { m ->
-                                if (m > 0) liveMap = m
-                            }
-                        }
-                        1 -> {
-                            val rCool = sendElmCommandInternal("0105", 400L)
-                            parsePidBytes(rCool, "41", "05")?.firstOrNull()?.let { c ->
-                                liveCoolant = c - 40
-                            }
-                            val rAir = sendElmCommandInternal("010F", 400L)
-                            parsePidBytes(rAir, "41", "0F")?.firstOrNull()?.let { a ->
-                                liveIntake = a - 40
-                            }
-                        }
-                        2 -> {
-                            val rThr = sendElmCommandInternal("0111", 400L)
-                            parsePidBytes(rThr, "41", "11")?.firstOrNull()?.let { t ->
-                                liveThrottle = (t * 100.0) / 255.0
-                            }
-                            val rLoad = sendElmCommandInternal("0104", 400L)
-                            parsePidBytes(rLoad, "41", "04")?.firstOrNull()?.let { ld ->
-                                liveLoad = (ld * 100.0) / 255.0
-                            }
-                        }
-                        3 -> {
-                            val rStft = sendElmCommandInternal("0106", 400L)
-                            parsePidBytes(rStft, "41", "06")?.firstOrNull()?.let { s ->
-                                liveStft = ((s * 100.0) / 128.0) - 100.0
-                            }
-                            val rMaf = sendElmCommandInternal("0110", 400L)
-                            parsePidBytes(rMaf, "41", "10")?.let { b ->
-                                if (b.size >= 2) liveMaf = ((b[0] * 256) + b[1]) / 100.0
-                            }
-                        }
-                    }
-                    tick++
-
-                    val snap = JSONObject()
-                    snap.put("speed", liveSpeed)
-                    snap.put("rpm", liveRpm)
-                    snap.put("voltage", liveVoltage)
-                    snap.put("voltMin", liveVoltMin)
-                    snap.put("coolant", liveCoolant)
-                    snap.put("intake", liveIntake)
-                    snap.put("map", liveMap)
-                    snap.put("baro", liveBaro)
-                    snap.put("throttle", liveThrottle)
-                    snap.put("load", liveLoad)
-                    snap.put("maf", liveMaf)
-                    snap.put("stft", liveStft)
-                    snap.put("o2B1S1", liveO2B1S1)
-                    snap.put("o2B1S2", liveO2B1S2)
-                    cachedTelemetryJson = snap.toString()
-
-                    Thread.sleep(60)
-                } catch (_: Exception) {
-                    try { Thread.sleep(200) } catch (_: Exception) {}
-                }
-            }
-        }.apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun decodeTwoBytesToDtc(b1Hex: String, b2Hex: String): String? {
-        val b1 = b1Hex.toIntOrNull(16) ?: return null
-        val b2 = b2Hex.uppercase()
-        if (b1 == 0 && b2 == "00") return null
-        if (b1 == 0xFF && b2 == "FF") return null
-        val cats = arrayOf("P", "C", "B", "U")
-        val cat = cats[(b1 shr 6) and 0x03]
-        val d2 = ((b1 shr 4) and 0x03).toString()
-        val d3 = (b1 and 0x0F).toString(16).uppercase()
-        return cat + d2 + d3 + b2.padStart(2, '0')
-    }
-
-    private fun parseDtcBytesUniversal(raw: String, modeReplyHex: String): List<String> {
-        if (raw.isEmpty()) return emptyList()
-        val found = mutableListOf<String>()
-        val lines = raw.lines()
-        val allBytes = mutableListOf<String>()
-        for (line in lines) {
-            var s = line.trim().uppercase()
-            if (s.isEmpty() || s.contains("SEARCHING") || s.contains("NO DATA") || s.contains("UNABLE") || s.contains("ERROR") || s == "OK") continue
-            s = s.replace(Regex("^[0-9A-F]:[ ]*"), "")
-            s = s.replace(Regex("^7E[0-9A-F][ ]+[0-9A-F]{2}[ ]+"), "")
-            val cleanHex = s.replace(Regex("[^0-9A-F]"), "")
-            if (cleanHex.length >= 2 && cleanHex.length % 2 == 0) {
-                var k = 0
-                while (k + 1 < cleanHex.length) {
-                    allBytes.add(cleanHex.substring(k, k + 2))
-                    k += 2
-                }
+    private fun initializeElm() {
+        command("ATZ", 2500)
+        for (cmd in listOf("ATE0", "ATL0", "ATS1", "ATH0", "ATSP0")) {
+            if (!Regex("(?m)^\\s*OK\\s*$").containsMatchIn(command(cmd).replace('\r', '\n'))) {
+                throw IOException("Adapter rejected $cmd. Use a compatible ELM327 adapter.")
             }
         }
-        for (i in allBytes.indices) {
-            if (allBytes[i] == modeReplyHex) {
-                val rem = allBytes.subList(i + 1, allBytes.size)
-                if (rem.isEmpty()) break
-                val firstVal = rem[0].toIntOrNull(16) ?: 0
-                val startIdx = if (rem.size % 2 == 1 || (firstVal in 1..12 && rem.size == 1 + firstVal * 2)) 1 else 0
-                var j = startIdx
-                while (j + 1 < rem.size) {
-                    val b1 = rem[j]
-                    val b2 = rem[j + 1]
-                    if (b1 == "43" || b1 == "47" || b1 == "4A") break
-                    decodeTwoBytesToDtc(b1, b2)?.let { code ->
-                        if (!found.contains(code)) found.add(code)
-                    }
-                    j += 2
-                }
-            }
+        if (ObdParser.pid(command("0100", 10000), 0, 4) == null) {
+            throw IOException("Adapter responded, but no ECU replied. Check ignition, cable, and vehicle OBD-II compatibility.")
         }
-        return found
+        val protocolReply = command("ATDPN").trim().uppercase()
+        val protocol = Regex("^(?:A)?([1-9])$").find(protocolReply)?.groupValues?.get(1)?.toIntOrNull()
+            ?: throw IOException("Could not identify the ECU protocol. Reconnect with a compatible ELM327 adapter.")
+        countedDtcs = protocol in 6..9
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectDeviceWithFallback(device: BluetoothDevice): String {
-        closeActiveSocketCleanly()
+    private fun connect(mac: String, expectedGeneration: Long): String {
+        requireBluetooth()
+        if (!BluetoothAdapter.checkBluetoothAddress(mac)) throw IOException("Choose a valid paired adapter.")
+        val token = synchronized(sessionLock) {
+            if (!foreground || destroyed || generation.get() != expectedGeneration) throw IOException("Connection cancelled.")
+            disconnect()
+            state = "connecting"
+            generation.get()
+        }
+        val device = adapter!!.bondedDevices.firstOrNull { it.address.equals(mac, true) }
+            ?: throw IOException("Pair this adapter in Android Settings first.")
+        deviceLabel = device.name ?: device.address
         try {
-            if (bluetoothAdapter?.isDiscovering == true) {
-                bluetoothAdapter.cancelDiscovery()
-                Thread.sleep(250)
+            if (Build.VERSION.SDK_INT < 31 || checkSelfPermission("android.permission.BLUETOOTH_SCAN") == PackageManager.PERMISSION_GRANTED) adapter?.cancelDiscovery()
+            if (device.type == BluetoothDevice.DEVICE_TYPE_LE) {
+                connectBle(device, token)
+            } else {
+                var failure: Exception? = null
+                for (secure in listOf(true, false)) {
+                    if (generation.get() != token) throw IOException("Connection cancelled.")
+                    val candidate = if (secure) device.createRfcommSocketToServiceRecord(SPP_UUID) else device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+                    synchronized(sessionLock) {
+                        if (generation.get() != token) { candidate.close(); throw IOException("Connection cancelled.") }
+                        socket = candidate
+                    }
+                    val timeout = watchdog.schedule({ try { candidate.close() } catch (_: Exception) { } }, 8, TimeUnit.SECONDS)
+                    try {
+                        candidate.connect()
+                        timeout.cancel(false)
+                        failure = null
+                        break
+                    } catch (e: Exception) {
+                        timeout.cancel(false)
+                        try { candidate.close() } catch (_: Exception) { }
+                        socket = null
+                        failure = e
+                    }
+                }
+                if (failure != null) {
+                    if (device.type == BluetoothDevice.DEVICE_TYPE_DUAL) connectBle(device, token)
+                    else throw IOException("Could not connect. Check adapter power and disconnect other scanner apps.", failure)
+                }
             }
-        } catch (_: Exception) {}
-
-        val strategies = listOf<Pair<String, () -> BluetoothSocket>>(
-            "Insecure SPP UUID" to { device.createInsecureRfcommSocketToServiceRecord(SPP_UUID) },
-            "Secure SPP UUID" to { device.createRfcommSocketToServiceRecord(SPP_UUID) },
-            "Insecure RFCOMM Ch 1" to {
-                val m = device.javaClass.getMethod("createInsecureRfcommSocket", Int::class.javaPrimitiveType)
-                m.invoke(device, 1) as BluetoothSocket
-            },
-            "Secure RFCOMM Ch 1" to {
-                val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                m.invoke(device, 1) as BluetoothSocket
-            },
-            "RFCOMM Ch 2" to {
-                val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                m.invoke(device, 2) as BluetoothSocket
-            },
-            "RFCOMM Ch 16 (ELM327)" to {
-                val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                m.invoke(device, 16) as BluetoothSocket
+            initializeElm()
+            synchronized(sessionLock) {
+                if (generation.get() != token || !foreground) throw IOException("Connection cancelled.")
+                state = "connected"
             }
-        )
-
-        var lastError = ""
-        for ((label, factory) in strategies) {
-            try {
-                closeActiveSocketCleanly()
-                val candidate = factory()
-                candidate.connect()
-                btSocket = candidate
-                outStream = candidate.outputStream
-                inStream = candidate.inputStream
-                Thread.sleep(150)
-                sendElmCommandInternal("ATZ", 900L)
-                sendElmCommandInternal("ATE0", 400L)
-                sendElmCommandInternal("ATL0", 400L)
-                sendElmCommandInternal("ATSP0", 600L)
-                startBackgroundTelemetryWorker()
-                return "CONNECTED:${device.name ?: "OBD-II"} [${device.address}] ($label)"
-            } catch (e: Exception) {
-                lastError = "${e.message}"
-                closeActiveSocketCleanly()
-                try { Thread.sleep(150) } catch (_: Exception) {}
-            }
+            tick = 0
+            return "CONNECTED:$deviceLabel"
+        } catch (e: Exception) {
+            if (generation.get() == token) failConnection(e.message ?: "Connection failed.")
+            throw e
         }
-
-        val bleRes = tryConnectNativeBleGatt(device)
-        if (bleRes.startsWith("CONNECTED:")) {
-            startBackgroundTelemetryWorker()
-            return bleRes
-        }
-
-        return "ERROR: Could not open OBD socket on ${device.name ?: device.address} ($lastError)."
     }
 
     @SuppressLint("MissingPermission")
-    private fun tryConnectNativeBleGatt(device: BluetoothDevice): String {
-        val latch = CountDownLatch(1)
-        var connectedOk = false
-        val gattCallback = object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    latch.countDown()
+    private fun connectBle(device: BluetoothDevice, token: Long) {
+        val ready = CountDownLatch(1)
+        setupLatch = ready
+        var setupError = "BLE setup timed out."
+        var subscribed = false
+        val callback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(connection: BluetoothGatt, status: Int, newState: Int) {
+                if (generation.get() != token) { connection.close(); return }
+                if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                    if (!connection.discoverServices()) ready.countDown()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
+                    setupError = "BLE adapter disconnected ($status)."
+                    ready.countDown()
+                    if (state == "connected") failConnection(setupError, token)
                 }
             }
-
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    for (service in gatt.services) {
-                        val sUuid = service.uuid.toString().lowercase()
-                        if (sUuid.contains("fff0") || sUuid.contains("ffe0") || sUuid.contains("18f0") || sUuid.contains("6e400001")) {
-                            for (ch in service.characteristics) {
-                                val props = ch.properties
-                                if ((props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-                                    gatt.setCharacteristicNotification(ch, true)
-                                }
-                                if ((props and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0) {
-                                    bleWriteChar = ch
-                                }
-                            }
-                        }
-                    }
-                    if (bleWriteChar != null) connectedOk = true
+            override fun onServicesDiscovered(connection: BluetoothGatt, status: Int) {
+                if (generation.get() != token) return
+                if (status != BluetoothGatt.GATT_SUCCESS) { ready.countDown(); return }
+                for (service in connection.services) {
+                    val id = service.uuid.toString()
+                    if (!listOf("0000fff0-", "0000ffe0-", "000018f0-", "6e400001-").any { id.startsWith(it) }) continue
+                    val writer = service.characteristics.firstOrNull {
+                        it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                    } ?: continue
+                    val notifier = service.characteristics.firstOrNull {
+                        it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+                    } ?: continue
+                    val descriptor = notifier.getDescriptor(CCCD_UUID) ?: continue
+                    writeCharacteristic = writer
+                    if (!connection.setCharacteristicNotification(notifier, true)) continue
+                    descriptor.value = if (notifier.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
+                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                    if (connection.writeDescriptor(descriptor)) return
                 }
-                latch.countDown()
+                setupError = "No supported BLE serial service with notifications was found."
+                ready.countDown()
             }
-
-            override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-                val bytes = characteristic.value ?: return
-                lastBleResponse += String(bytes, Charsets.US_ASCII)
+            override fun onDescriptorWrite(connection: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                if (generation.get() != token) return
+                subscribed = status == BluetoothGatt.GATT_SUCCESS
+                if (!subscribed) setupError = "BLE notification subscription failed ($status)."
+                ready.countDown()
+            }
+            override fun onCharacteristicWrite(connection: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                if (generation.get() != token) return
+                writeSucceeded = status == BluetoothGatt.GATT_SUCCESS
+                writeLatch?.countDown()
+            }
+            override fun onCharacteristicChanged(connection: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+                if (generation.get() != token) return
+                synchronized(responseLock) {
+                    if (bleResponse.length < 32768) bleResponse.append(String(characteristic.value ?: byteArrayOf(), Charsets.US_ASCII))
+                    responseLock.notifyAll()
+                }
             }
         }
-
-        return try {
-            bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                device.connectGatt(this@MainActivity, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-            } else {
-                device.connectGatt(this@MainActivity, false, gattCallback)
-            }
-            latch.await(4500, TimeUnit.MILLISECONDS)
-            if (connectedOk) {
-                "CONNECTED:${device.name ?: "BLE-OBD"} [${device.address}] (BLE GATT)"
-            } else {
-                try { bluetoothGatt?.close() } catch (_: Exception) {}
-                bluetoothGatt = null
-                "ERROR: BLE GATT service not found"
-            }
-        } catch (e: Exception) {
-            "ERROR:${e.message}"
+        synchronized(sessionLock) {
+            if (generation.get() != token) throw IOException("Connection cancelled.")
+            gatt = device.connectGatt(this, false, callback, BluetoothDevice.TRANSPORT_LE)
         }
+        val complete = ready.await(8, TimeUnit.SECONDS)
+        setupLatch = null
+        if (!complete || !subscribed || generation.get() != token) throw IOException(setupError)
+    }
+
+    private fun record(key: String, value: Double) { readings[key] = Reading(value) }
+    private fun readPid(pid: Int, size: Int, key: String, decode: (List<Int>) -> Double) {
+        ObdParser.pid(command("01%02X".format(pid)), pid, size)?.let { record(key, decode(it)) }
+    }
+    private fun pollTelemetry() {
+        readPid(0x0C, 2, "rpm") { (it[0] * 256 + it[1]) / 4.0 }
+        readPid(0x0D, 1, "speed") { it[0].toDouble() }
+        when (tick++ % 6) {
+            0 -> {
+                ObdParser.voltage(command("ATRV"))?.let {
+                    record("voltage", it)
+                    record("voltMin", minOf(readings["voltMin"]?.value ?: it, it))
+                }
+                readPid(0x0B, 1, "map") { it[0].toDouble() }
+            }
+            1 -> {
+                readPid(0x05, 1, "coolant") { it[0] - 40.0 }
+                readPid(0x0F, 1, "intake") { it[0] - 40.0 }
+            }
+            2 -> {
+                readPid(0x11, 1, "throttle") { it[0] * 100.0 / 255 }
+                readPid(0x04, 1, "load") { it[0] * 100.0 / 255 }
+            }
+            3 -> {
+                readPid(0x06, 1, "stft") { it[0] * 100.0 / 128 - 100 }
+                readPid(0x10, 2, "maf") { (it[0] * 256 + it[1]) / 100.0 }
+            }
+            4 -> readPid(0x33, 1, "baro") { it[0].toDouble() }
+            5 -> {
+                readPid(0x14, 2, "o2B1S1") { it[0] / 200.0 }
+                readPid(0x15, 2, "o2B1S2") { it[0] / 200.0 }
+            }
+        }
+    }
+
+    private fun scanDtcs(): JSONObject {
+        if (state != "connected") throw IOException("Connect to an ECU before scanning.")
+        val codes = JSONArray()
+        val result = JSONObject()
+        val errors = JSONArray()
+        for ((request, reply, mode) in listOf(Triple("03", 0x43, "STORED"), Triple("07", 0x47, "PENDING"), Triple("0A", 0x4A, "PERMANENT"))) {
+            val raw = command(request, 4000)
+            result.put("mode$request", raw)
+            if (!ObdParser.validDtcReply(raw, reply, countedDtcs)) {
+                errors.put("Mode $request: ${raw.take(120).ifEmpty { "No response" }}")
+                continue
+            }
+            for (code in ObdParser.dtcs(raw, reply, countedDtcs)) codes.put(JSONObject().put("code", code).put("mode", mode).put("modeLabel", "Mode $request ${mode.lowercase()}"))
+        }
+        return result.put("codes", codes).put("errors", errors).put("complete", errors.length() == 0)
     }
 
     inner class ObdBridge {
-        @JavascriptInterface
-        fun getLiveTelemetryJson(): String {
-            return cachedTelemetryJson
-        }
-
-        @JavascriptInterface
-        fun scanAllDtcModesJson(): String {
-            synchronized(ioLock) {
-                val r03 = sendElmCommandInternal("03", 2000L)
-                val r07 = sendElmCommandInternal("07", 2000L)
-                val r0A = sendElmCommandInternal("0A", 1600L)
-
-                val codesArr = JSONArray()
-                val seen = mutableSetOf<String>()
-
-                for (c in parseDtcBytesUniversal(r03, "43")) {
-                    if (seen.add(c)) {
-                        val obj = JSONObject()
-                        obj.put("code", c)
-                        obj.put("mode", "STORED")
-                        obj.put("modeLabel", "Mode 03 Stored")
-                        codesArr.put(obj)
-                    }
-                }
-                for (c in parseDtcBytesUniversal(r07, "47")) {
-                    if (seen.add(c)) {
-                        val obj = JSONObject()
-                        obj.put("code", c)
-                        obj.put("mode", "PENDING")
-                        obj.put("modeLabel", "Mode 07 Pending")
-                        codesArr.put(obj)
-                    }
-                }
-                for (c in parseDtcBytesUniversal(r0A, "4A")) {
-                    if (seen.add(c)) {
-                        val obj = JSONObject()
-                        obj.put("code", c)
-                        obj.put("mode", "STORED")
-                        obj.put("modeLabel", "Mode 0A Permanent")
-                        codesArr.put(obj)
-                    }
-                }
-
-                val out = JSONObject()
-                out.put("mode03", r03)
-                out.put("mode07", r07)
-                out.put("mode0A", r0A)
-                out.put("codes", codesArr)
-                return out.toString()
+        @JavascriptInterface fun getConnectionStateJson(): String = JSONObject()
+            .put("connected", state == "connected").put("state", state).put("device", deviceLabel).put("error", lastError).toString()
+        @JavascriptInterface fun getLiveTelemetryJson(): String {
+            val now = System.currentTimeMillis()
+            val result = JSONObject().put("connected", state == "connected").put("state", state)
+            var newest = 0L
+            for (key in listOf("speed", "rpm", "voltage", "voltMin", "coolant", "intake", "map", "baro", "throttle", "load", "maf", "stft", "o2B1S1", "o2B1S2")) {
+                val reading = readings[key]
+                val fresh = state == "connected" && reading != null && now - reading.at <= 10000
+                result.put(key, if (fresh) reading!!.value else JSONObject.NULL)
+                if (fresh) newest = maxOf(newest, reading!!.at)
             }
+            return result.put("updatedAt", newest).toString()
         }
-
-        @JavascriptInterface
-        fun runLiveCompressionSampleJson(): String {
-            synchronized(ioLock) {
-                val rpmSamples = mutableListOf<Int>()
-                var minV = liveVoltage
-                for (i in 0 until 4) {
-                    val rRpm = sendElmCommandInternal("010C", 380L)
-                    parsePidBytes(rRpm, "41", "0C")?.let { b ->
-                        if (b.size >= 2) {
-                            val rpm = ((b[0] * 256) + b[1]) / 4
-                            liveRpm = rpm
-                            rpmSamples.add(rpm)
+        @SuppressLint("MissingPermission")
+        @JavascriptInterface fun listPairedDevices(): String {
+            requireBluetooth()
+            val devices = JSONArray()
+            adapter!!.bondedDevices.sortedBy { it.name ?: it.address }.forEach {
+                devices.put(JSONObject().put("name", it.name ?: "Unnamed adapter").put("address", it.address)
+                    .put("type", if (it.type == BluetoothDevice.DEVICE_TYPE_LE) "BLE" else "Classic / dual"))
+            }
+            return devices.toString()
+        }
+        @JavascriptInterface fun requestOperation(requestId: String, operation: String, argument: String) {
+            if (destroyed || requestId.length > 100 || argument.length > 200) return
+            if (operation == "disconnect") disconnect()
+            val requestGeneration = generation.get()
+            worker.execute {
+                val result = JSONObject()
+                try {
+                    if (operation in listOf("scanDtc", "clearDtc") && generation.get() != requestGeneration) throw IOException("Operation cancelled because the connection changed.")
+                    val data: Any = when (operation) {
+                        "listDevices" -> JSONArray(listPairedDevices())
+                        "connect" -> connect(argument.trim().uppercase(), requestGeneration)
+                        "disconnect" -> "DISCONNECTED"
+                        "scanDtc" -> scanDtcs()
+                        "clearDtc" -> {
+                            if (state != "connected") throw IOException("Connect to an ECU before clearing codes.")
+                            val response = command("04", 6000)
+                            val success = ObdParser.hasReply(response, 0x44) && !ObdParser.hasNegativeReply(response, 0x04)
+                            JSONObject().put("success", success).put("response", response)
+                                .put("error", if (success) "" else "ECU did not confirm clearing codes. Permanent codes cannot be cleared by this command.")
                         }
+                        "compression" -> JSONObject().put("supported", false).put("error", "OBD-II polling cannot measure cylinder compression. Use a dedicated compression tester.")
+                        else -> throw IOException("Unknown operation.")
                     }
-                    val rVolt = sendElmCommandInternal("ATRV", 350L)
-                    extractVoltageNumber(rVolt)?.let { v ->
-                        if (v > 5.0) {
-                            liveVoltage = v
-                            if (v < minV) minV = v
-                        }
-                    }
+                    result.put("ok", true).put("data", data)
+                } catch (e: Exception) {
+                    if (operation == "connect" && state == "connecting") failConnection(e.message ?: "Connection failed.")
+                    result.put("ok", false).put("error", e.message ?: "Operation failed.")
                 }
-                val rMap = sendElmCommandInternal("010B", 380L)
-                parsePidBytes(rMap, "41", "0B")?.firstOrNull()?.let { m ->
-                    if (m > 0) liveMap = m
-                }
-                if (minV < liveVoltMin || liveVoltMin == 0.0) liveVoltMin = minV
-
-                val avgRpm = if (rpmSamples.isNotEmpty()) rpmSamples.average().roundToInt() else liveRpm
-                val vac = max(0, liveBaro - liveMap)
-                val baseComp = min(99, max(78, 86 + (vac / 6)))
-                val cylArr = JSONArray()
-                for (cyl in 1..4) {
-                    val sampleRpm = rpmSamples.getOrElse(cyl - 1) { avgRpm }
-                    val diff = sampleRpm - avgRpm
-                    val pct = min(100, max(65, baseComp - (abs(diff) / 12) + ((cyl + avgRpm) % 3 - 1)))
-                    val drop = max(120, (185 + vac * 0.6 + diff * 0.5).roundToInt())
-                    val sag = ((minV - 1.8) + (100 - pct) * 0.02)
-                    val cObj = JSONObject()
-                    cObj.put("cyl", cyl)
-                    cObj.put("pct", pct)
-                    cObj.put("rpmDrop", drop)
-                    cObj.put("voltSag", (sag * 100.0).roundToInt() / 100.0)
-                    cObj.put("status", if (pct < 85) "WEAK (${pct - 100}%)" else "HEALTHY")
-                    cylArr.put(cObj)
-                }
-
-                val res = JSONObject()
-                res.put("rpm", liveRpm)
-                res.put("map", liveMap)
-                res.put("baro", liveBaro)
-                res.put("voltMin", liveVoltMin)
-                res.put("cylinders", cylArr)
-                return res.toString()
-            }
-        }
-
-        @SuppressLint("MissingPermission")
-        @JavascriptInterface
-        fun listPairedDevices(): String {
-            val adapter = bluetoothAdapter ?: return "[]"
-            if (!adapter.isEnabled) return "[]"
-            val arr = JSONArray()
-            val obdRegex = Regex("OBD|ELM|V-LINK|VGATE|KONNWEI|SCAN|IOS|CAR|ECU|CBT|CHX", RegexOption.IGNORE_CASE)
-            val sorted = adapter.bondedDevices.sortedByDescending { d -> obdRegex.containsMatchIn(d.name ?: "") }
-            for (d in sorted) {
-                val obj = JSONObject()
-                obj.put("name", d.name ?: "Unknown Device")
-                obj.put("address", d.address ?: "")
-                val tStr = when (d.type) {
-                    BluetoothDevice.DEVICE_TYPE_LE -> "BLE 4.0+"
-                    BluetoothDevice.DEVICE_TYPE_DUAL -> "Dual SPP/BLE"
-                    else -> "Classic SPP"
-                }
-                obj.put("type", tStr)
-                arr.put(obj)
-            }
-            return arr.toString()
-        }
-
-        @SuppressLint("MissingPermission")
-        @JavascriptInterface
-        fun connectByMacAddress(macAddress: String): String {
-            val adapter = bluetoothAdapter ?: return "ERROR: No Bluetooth Adapter"
-            if (!adapter.isEnabled) return "ERROR: Bluetooth is turned off"
-            val target = adapter.bondedDevices.firstOrNull { it.address.equals(macAddress.trim(), ignoreCase = true) }
-                ?: adapter.getRemoteDevice(macAddress.trim())
-            return connectDeviceWithFallback(target)
-        }
-
-        @SuppressLint("MissingPermission")
-        @JavascriptInterface
-        fun connectPairedObdDevice(deviceNameHint: String): String {
-            val adapter = bluetoothAdapter ?: return "ERROR: No Bluetooth Adapter"
-            if (!adapter.isEnabled) return "ERROR: Bluetooth is turned off"
-            val bonded = adapter.bondedDevices.toList()
-            if (bonded.isEmpty()) return "ERROR: No paired Bluetooth devices found. Pair your OBD-II reader in Android Settings first."
-
-            val obdRegex = Regex("OBD|ELM|V-LINK|VGATE|KONNWEI|SCAN|IOS|CAR|ECU|CBT|CHX", RegexOption.IGNORE_CASE)
-            val candidates = bonded.sortedByDescending { d ->
-                (d.name?.contains(deviceNameHint, ignoreCase = true) == true) || obdRegex.containsMatchIn(d.name ?: "")
-            }
-
-            var lastRes = ""
-            for (candidate in candidates.take(3)) {
-                val res = connectDeviceWithFallback(candidate)
-                if (res.startsWith("CONNECTED:")) return res
-                lastRes = res
-            }
-            return lastRes
-        }
-
-        @SuppressLint("MissingPermission")
-        @JavascriptInterface
-        fun connectBleObdNative(): String {
-            val adapter = bluetoothAdapter ?: return "ERROR: No Bluetooth Adapter"
-            if (!adapter.isEnabled) return "ERROR: Bluetooth is turned off"
-            val bleCandidates = adapter.bondedDevices.filter {
-                it.type == BluetoothDevice.DEVICE_TYPE_LE || it.type == BluetoothDevice.DEVICE_TYPE_DUAL ||
-                Regex("OBD|ELM|V-LINK|VGATE|KONNWEI|BLE|IOS", RegexOption.IGNORE_CASE).containsMatchIn(it.name ?: "")
-            }
-            for (c in bleCandidates) {
-                val res = tryConnectNativeBleGatt(c)
-                if (res.startsWith("CONNECTED:")) {
-                    startBackgroundTelemetryWorker()
-                    return res
+                runOnUiThread {
+                    if (!destroyed) webView.evaluateJavascript("window.onObdResult && window.onObdResult(${JSONObject.quote(requestId)},$result)", null)
                 }
             }
-            return "ERROR: No BLE GATT OBD-II responder found among paired devices. Tap your adapter in Option 1 above."
         }
-
-        @SuppressLint("MissingPermission")
-        @JavascriptInterface
-        fun sendElmCommand(cmd: String): String {
-            return sendElmCommandInternal(cmd, 1200L)
-        }
-
-        @JavascriptInterface
-        fun disconnectObd(): String {
-            closeActiveSocketCleanly()
-            return "DISCONNECTED"
-        }
+        @JavascriptInterface fun connectByMacAddress(mac: String): String = "ERROR:Use requestOperation to connect asynchronously."
+        @JavascriptInterface fun connectPairedObdDevice(hint: String): String = "ERROR:Choose a paired adapter explicitly."
+        @JavascriptInterface fun connectBleObdNative(): String = "ERROR:Choose a paired BLE adapter explicitly."
+        @JavascriptInterface fun disconnectObd(): String { disconnect(); return "DISCONNECTED" }
+        @JavascriptInterface fun scanAllDtcModesJson(): String = JSONObject().put("error", "Use requestOperation to scan asynchronously.").put("codes", JSONArray()).toString()
+        @JavascriptInterface fun runLiveCompressionSampleJson(): String = JSONObject().put("supported", false).put("error", "A dedicated compression tester is required.").toString()
+        @JavascriptInterface fun sendElmCommand(cmd: String): String = "ERROR:Use the validated operation interface."
     }
 }

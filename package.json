@@ -1,0 +1,23 @@
+{
+  "name": "motoobd-android10-scanner",
+  "version": "2.4.0",
+  "description": "MotoOBD Android WebView regression checks",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mr03k/motoobd-android10-scanner.git"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/mr03k/motoobd-android10-scanner/issues"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "prettier": "3.7.4"
+  },
+  "private": true
+}
