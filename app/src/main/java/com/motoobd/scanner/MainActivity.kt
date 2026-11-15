@@ -50,6 +50,14 @@ class MainActivity : Activity() {
     private var tick = 0
     private data class Reading(val value: Double, val at: Long = System.currentTimeMillis())
     private val readings = ConcurrentHashMap<String, Reading>()
+    private data class Parameter(val pid: Int, val ecu: String, val bytes: List<Int>, val at: Long, val error: String = "")
+    private val parameters = ConcurrentHashMap<String, Parameter>()
+    @Volatile private var capabilities = CapabilityDiscovery.Result(emptyMap(), emptyMap(), emptyList())
+    @Volatile private var identifiedCan = false
+    private var pollPids = emptyList<Int>()
+    private var slowCursor = 0
+    private var freezeCursor = 0
+    private var infoCursor = 0
 
     companion object {
         private val SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
@@ -147,6 +155,12 @@ class MainActivity : Activity() {
         deviceLabel = ""
         closeTransport()
         readings.clear()
+        parameters.clear()
+        capabilities = CapabilityDiscovery.Result(emptyMap(), emptyMap(), emptyList())
+        identifiedCan = false
+        pollPids = emptyList()
+        freezeCursor = 0
+        infoCursor = 0
         countedDtcs = false
     }
 
@@ -171,7 +185,8 @@ class MainActivity : Activity() {
         val request = (cmd.trim() + "\r").toByteArray(Charsets.US_ASCII)
         val activeGatt = gatt
         val characteristic = writeCharacteristic
-        val deadline = SystemClock.elapsedRealtime() + timeout
+        var deadline = SystemClock.elapsedRealtime() + timeout
+        var pendingExtended = false
         if (activeGatt != null && characteristic != null) {
             synchronized(responseLock) { bleResponse.setLength(0) }
             for (chunk in request.asList().chunked(20)) {
@@ -187,6 +202,10 @@ class MainActivity : Activity() {
             }
             synchronized(responseLock) {
                 while (!bleResponse.contains(">")) {
+                    if (!pendingExtended && Regex("7F\\s*[0-9A-F]{2}\\s*78", RegexOption.IGNORE_CASE).containsMatchIn(bleResponse)) {
+                        deadline = SystemClock.elapsedRealtime() + 8000
+                        pendingExtended = true
+                    }
                     if (gatt !== activeGatt) throw IOException("Adapter disconnected.")
                     val remaining = deadline - SystemClock.elapsedRealtime()
                     if (remaining <= 0) throw IOException("Adapter did not finish its reply. Reconnect and retry.")
@@ -210,6 +229,10 @@ class MainActivity : Activity() {
                     val size = input.read(bytes, 0, minOf(available, bytes.size))
                     if (size < 0) throw IOException("Adapter disconnected.")
                     response.append(String(bytes, 0, size, Charsets.US_ASCII))
+                    if (!pendingExtended && Regex("7F\\s*[0-9A-F]{2}\\s*78", RegexOption.IGNORE_CASE).containsMatchIn(response)) {
+                        deadline = SystemClock.elapsedRealtime() + 8000
+                        pendingExtended = true
+                    }
                     if (response.length > 32768) throw IOException("Adapter reply is too large.")
                     if (response.contains(">")) { complete = true; break }
                 } else Thread.sleep(10)
@@ -233,6 +256,11 @@ class MainActivity : Activity() {
         val protocol = Regex("^(?:A)?([1-9])$").find(protocolReply)?.groupValues?.get(1)?.toIntOrNull()
             ?: throw IOException("Could not identify the ECU protocol. Reconnect with a compatible ELM327 adapter.")
         countedDtcs = protocol in 6..9
+        // CAN headers permit stable ECU attribution and safe ISO-TP reassembly.
+        if (countedDtcs && command("ATH1").trim() == "OK") identifiedCan = true
+        capabilities = discoverCapabilities(1)
+        pollPids = CapabilityDiscovery.pollOrder(capabilities.supported)
+        slowCursor = 0
     }
 
     @SuppressLint("MissingPermission")
@@ -359,41 +387,218 @@ class MainActivity : Activity() {
         if (!complete || !subscribed || generation.get() != token) throw IOException(setupError)
     }
 
-    private fun record(key: String, value: Double) { readings[key] = Reading(value) }
-    private fun readPid(pid: Int, size: Int, key: String, decode: (List<Int>) -> Double) {
-        ObdParser.pid(command("01%02X".format(pid)), pid, size)?.let { record(key, decode(it)) }
+    private fun ensureSession(token: Long) {
+        if (generation.get() != token || state !in listOf("connecting", "connected")) throw IOException("Operation cancelled because the connection changed.")
     }
-    private fun pollTelemetry() {
-        readPid(0x0C, 2, "rpm") { (it[0] * 256 + it[1]) / 4.0 }
-        readPid(0x0D, 1, "speed") { it[0].toDouble() }
-        when (tick++ % 6) {
-            0 -> {
-                ObdParser.voltage(command("ATRV"))?.let {
-                    record("voltage", it)
-                    record("voltMin", minOf(readings["voltMin"]?.value ?: it, it))
-                }
-                readPid(0x0B, 1, "map") { it[0].toDouble() }
-            }
-            1 -> {
-                readPid(0x05, 1, "coolant") { it[0] - 40.0 }
-                readPid(0x0F, 1, "intake") { it[0] - 40.0 }
-            }
-            2 -> {
-                readPid(0x11, 1, "throttle") { it[0] * 100.0 / 255 }
-                readPid(0x04, 1, "load") { it[0] * 100.0 / 255 }
-            }
-            3 -> {
-                readPid(0x06, 1, "stft") { it[0] * 100.0 / 128 - 100 }
-                readPid(0x10, 2, "maf") { (it[0] * 256 + it[1]) / 100.0 }
-            }
-            4 -> readPid(0x33, 1, "baro") { it[0].toDouble() }
-            5 -> {
-                readPid(0x14, 2, "o2B1S1") { it[0] / 200.0 }
-                readPid(0x15, 2, "o2B1S2") { it[0] / 200.0 }
-            }
+    private fun discoverCapabilities(mode: Int, deadline: Long = Long.MAX_VALUE): CapabilityDiscovery.Result {
+        val token = generation.get()
+        return CapabilityDiscovery.discover(mode) { request ->
+            ensureSession(token)
+            if (SystemClock.elapsedRealtime() >= deadline) throw DiagnosticBudgetException()
+            command(request, 1800)
         }
     }
+    private class DiagnosticBudgetException : IOException("Diagnostic read reached its time limit. Partial results are shown; retry to refresh.")
+    private fun record(key: String, value: Double) { readings[key] = Reading(value) }
+    private val legacyKeys = mapOf(0x0C to "rpm", 0x0D to "speed", 0x05 to "coolant", 0x0F to "intake", 0x0B to "map", 0x33 to "baro", 0x11 to "throttle", 0x04 to "load", 0x10 to "maf", 0x06 to "stft")
+    private fun readParameter(pid: Int) {
+        val raw = command("01%02X".format(pid), 1800)
+        parameters.entries.removeIf { it.value.pid == pid }
+        val replies = ObdParser.frames(raw).filter { it.bytes.size > 2 && it.bytes[0] == 0x41 && it.bytes[1] == pid }
+        val now = System.currentTimeMillis()
+        val bySource = replies.groupBy { it.ecu }
+        for ((ecu, supported) in capabilities.supported) {
+            if (pid !in supported) continue
+            val frames = bySource[ecu].orEmpty()
+            if (frames.isEmpty()) {
+                parameters["$ecu:%02X".format(pid)] = Parameter(pid, ecu, emptyList(), now, raw.take(160).ifEmpty { "No parameter data returned." })
+            }
+        }
+        bySource.forEach { (ecu, frames) -> frames.forEachIndexed { index, frame ->
+            val bytes = frame.bytes.drop(2)
+            val definition = PidCatalogue.definition(pid)
+            val error = if (bytes.size < definition.size) "Truncated PID reply." else ""
+            val source = if (frames.size > 1) "$ecu response ${index + 1}" else ecu
+            parameters["$source:%02X".format(pid)] = Parameter(pid, source, bytes, now, error)
+        } }
+        // Compatibility dashboard only uses an unambiguous single response or stable primary CAN ECU.
+        val primary = capabilities.supported.keys.filter { it != "unidentified" }.sorted().firstOrNull()
+        legacyKeys[pid]?.let { readings.remove(it) }
+        if (pid in listOf(0x14, 0x15)) readings.remove(if (pid == 0x14) "o2B1S1" else "o2B1S2")
+        val chosen = if (identifiedCan) replies.singleOrNull { it.ecu == primary } else replies.singleOrNull()
+        if (chosen != null) {
+            val bytes = chosen.bytes.drop(2)
+            val value = PidCatalogue.decode(pid, bytes)
+            if (value is Number) legacyKeys[pid]?.let { record(it, value.toDouble()) }
+            if (pid in listOf(0x14, 0x15) && bytes.size >= 2) record(if (pid == 0x14) "o2B1S1" else "o2B1S2", bytes[0] / 200.0)
+        }
+    }
+    private fun pollTelemetry() {
+        for (pid in listOf(0x0C, 0x0D)) if (pid in pollPids) readParameter(pid)
+        val slow = pollPids.filter { it !in listOf(0x0C, 0x0D) }
+        if (slow.isNotEmpty()) {
+            readParameter(slow[slowCursor % slow.size])
+            slowCursor = (slowCursor + 1) % slow.size
+        }
+        if (tick++ % 4 == 0) ObdParser.voltage(command("ATRV"))?.let {
+            record("voltage", it)
+            record("voltMin", minOf(readings["voltMin"]?.value ?: it, it))
+        }
+    }
+    private fun parameterJson(pid: Int, ecu: String, bytes: List<Int>, at: Long, status: String, error: String = "", supported: Boolean = true): JSONObject {
+        val definition = PidCatalogue.definition(pid)
+        val value = if (status in listOf("fresh", "stale")) PidCatalogue.decode(pid, bytes) else null
+        return JSONObject().put("id", "$ecu:%02X".format(pid)).put("ecu", ecu).put("pid", "%02X".format(pid))
+            .put("name", definition.name).put("unit", definition.unit).put("value", value ?: JSONObject.NULL)
+            .put("raw", PidCatalogue.rawHex(bytes)).put("status", status).put("updatedAt", at)
+            .put("supported", supported).put("decoded", value != null).put("error", error)
+            .put("staleAfterMs", maxOf(10000L, pollPids.size * 7000L))
+    }
+    private fun parameterSnapshot(): JSONArray {
+        val now = System.currentTimeMillis()
+        val staleAfter = maxOf(10000L, pollPids.size * 7000L)
+        val rows = JSONArray()
+        val snapshot = capabilities
+        for ((ecu, supported) in snapshot.supported.toSortedMap()) {
+            val known = PidCatalogue.knownPids().filter { (it - 1) / 32 * 32 in snapshot.ranges[ecu].orEmpty() }
+            for (pid in (known + supported).distinct().filter { it % 32 != 0 }.sorted()) {
+                val samples = parameters.values.filter { it.pid == pid && (it.ecu == ecu || it.ecu.startsWith("$ecu response ")) }.sortedBy { it.ecu }
+                if (samples.isEmpty()) rows.put(parameterJson(pid, ecu, emptyList(), 0,
+                    if (pid in supported) "read_failed" else "unsupported", if (pid in supported) "Waiting for first read." else "Not advertised by ECU.", pid in supported))
+                else samples.forEach { sample -> rows.put(parameterJson(pid, sample.ecu, sample.bytes, sample.at,
+                    if (sample.error.isNotEmpty()) "read_failed" else if (state != "connected" || now - sample.at > staleAfter) "stale" else "fresh", sample.error)) }
+            }
+        }
+        return rows
+    }
+    private fun unavailableStatus(raw: String, mode: Int): String = if (ObdParser.frames(raw).any {
+        it.bytes.size >= 3 && it.bytes[0] == 0x7F && it.bytes[1] == mode && it.bytes[2] in listOf(0x11, 0x12)
+    }) "unsupported" else "read_failed"
 
+    private fun readDiagnostics(): JSONObject {
+        if (state != "connected") throw IOException("Connect to an ECU before reading diagnostics.")
+        val token = generation.get()
+        val deadline = SystemClock.elapsedRealtime() + 120000
+        val readiness = JSONArray()
+        val freezeFrames = JSONArray()
+        val vehicleInfo = JSONArray()
+        val errors = JSONArray()
+        val rawResponses = JSONArray()
+        fun query(request: String): String {
+            ensureSession(token)
+            if (SystemClock.elapsedRealtime() >= deadline) throw DiagnosticBudgetException()
+            val raw = command(request, 2500)
+            rawResponses.put(JSONObject().put("request", request).put("response", raw))
+            val mode = request.take(2).toInt(16)
+            if (ObdParser.hasNegativeReply(raw, mode)) errors.put("Mode %02X request %s included a negative ECU reply: %s".format(mode, request, raw.take(160)))
+            return raw
+        }
+        fun issue(mode: String, raw: String): String {
+            val message = "$mode unavailable: ${raw.take(160).ifEmpty { "No reply" }}"
+            errors.put(message)
+            return message
+        }
+        try {
+            val rawReady = query("0101")
+            val readyFrames = ObdParser.frames(rawReady).filter { it.bytes.size >= 6 && it.bytes.take(2) == listOf(0x41, 1) }
+            if (readyFrames.isEmpty()) readiness.put(JSONObject().put("ecu", "unidentified").put("status", "read_failed").put("raw", rawReady).put("error", issue("Mode 01 readiness", rawReady)))
+            readyFrames.forEach { frame ->
+                val bytes = frame.bytes.drop(2)
+                val decoded = DiagnosticDecoder.readiness(bytes)!!
+                val monitors = JSONArray()
+                decoded.monitors.forEach { monitor -> monitors.put(JSONObject().put("name", monitor.name).put("supported", monitor.supported).put("complete", monitor.complete ?: JSONObject.NULL)) }
+                readiness.put(JSONObject().put("ecu", frame.ecu).put("mil", decoded.mil).put("dtcCount", decoded.dtcCount)
+                    .put("ignitionType", decoded.ignitionType).put("monitors", monitors).put("status", "fresh")
+                    .put("raw", PidCatalogue.rawHex(bytes)).put("error", ""))
+            }
+            val rawTrigger = query("020200")
+            val triggerFrames = ObdParser.frames(rawTrigger).filter { it.bytes.size >= 5 && it.bytes.take(3) == listOf(0x42, 2, 0) }
+            val freezeRows = linkedMapOf<String, JSONObject>()
+            if (triggerFrames.isEmpty()) freezeFrames.put(JSONObject().put("ecu", "unidentified").put("frame", 0).put("dtc", JSONObject.NULL)
+                .put("parameters", JSONArray()).put("status", unavailableStatus(rawTrigger, 2)).put("error", issue("Mode 02 frame 00", rawTrigger)).put("raw", rawTrigger))
+            triggerFrames.forEachIndexed { index, frame ->
+                val bytes = frame.bytes.drop(3).take(2)
+                val noFrame = bytes.all { it == 0 }
+                val ecu = if (triggerFrames.count { it.ecu == frame.ecu } > 1) "${frame.ecu} response ${index + 1}" else frame.ecu
+                val row = JSONObject().put("ecu", ecu).put("frame", 0).put("dtc", if (noFrame) JSONObject.NULL else PidCatalogue.decode(2, bytes))
+                    .put("parameters", JSONArray()).put("status", if (noFrame) "no_frame" else "fresh").put("error", "").put("raw", PidCatalogue.rawHex(bytes))
+                freezeRows[ecu] = row
+                freezeFrames.put(row)
+            }
+            if (triggerFrames.count { it.ecu == "unidentified" } > 1) {
+                val error = "Mode 02 has multiple unidentified responders. Snapshot fields cannot be associated safely; raw responses retained."
+                errors.put(error)
+                freezeRows.values.forEach { row -> if (row.optString("status") != "no_frame") row.put("status", "read_failed").put("error", error) }
+            }
+            if (freezeRows.values.any { it.optString("status") == "fresh" }) {
+                val support = CapabilityDiscovery.discover(2, ::query)
+                support.errors.forEach { errors.put(it) }
+                (support.supported.keys - freezeRows.keys).forEach { errors.put("Mode 02 source $it did not provide an unambiguous trigger code. Its parameter replies cannot be attached to a snapshot; raw replies retained.") }
+                val allPids = CapabilityDiscovery.pollOrder(support.supported).filter { it != 2 }
+                val frameDeadline = minOf(deadline - 45000, SystemClock.elapsedRealtime() + 45000)
+                val rotation = if (allPids.isEmpty()) emptyList() else allPids.drop(freezeCursor % allPids.size) + allPids.take(freezeCursor % allPids.size)
+                for (pid in rotation) {
+                    if (SystemClock.elapsedRealtime() >= frameDeadline) {
+                        errors.put("Mode 02 frame read is partial to reserve time for vehicle information. Refresh continues with the next fields.")
+                        break
+                    }
+                    val raw = query("02%02X00".format(pid))
+                    if (allPids.isNotEmpty()) freezeCursor = (allPids.indexOf(pid) + 1) % allPids.size
+                    val frames = ObdParser.frames(raw).filter { it.bytes.size > 3 && it.bytes.take(3) == listOf(0x42, pid, 0) }
+                    for ((ecu, advertised) in support.supported) {
+                        if (pid !in advertised) continue
+                        val matches = frames.filter { it.ecu == ecu }
+                        val row = freezeRows[ecu]
+                        // Without headers, associating multiple snapshot responders would fabricate a frame.
+                        if (row == null || row.optString("status") == "no_frame") continue
+                        if (matches.size != 1) {
+                            val error = if (matches.isEmpty()) "No frame parameter reply: ${raw.take(100)}" else "Multiple unidentified frame responders; raw replies retained."
+                            row.getJSONArray("parameters").put(parameterJson(pid, ecu, emptyList(), System.currentTimeMillis(), "read_failed", error))
+                            errors.put("Mode 02 PID %02X: %s".format(pid, error))
+                        } else {
+                            val bytes = matches.single().bytes.drop(3)
+                            val short = bytes.size < PidCatalogue.definition(pid).size
+                            if (short) errors.put("Mode 02 PID %02X from %s: truncated reply".format(pid, ecu))
+                            row.getJSONArray("parameters").put(parameterJson(pid, ecu, bytes, System.currentTimeMillis(), if (short) "read_failed" else "fresh", if (short) "Truncated frame parameter." else ""))
+                        }
+                    }
+                }
+            }
+            var infoSupportRaw = ""
+            val infoSupport = CapabilityDiscovery.discover(9) { request -> query(request).also { if (request == "0900") infoSupportRaw = it } }
+            infoSupport.errors.forEach { errors.put(it) }
+            if (infoSupport.supported.isEmpty()) vehicleInfo.put(JSONObject().put("ecu", "unidentified").put("pid", "00").put("name", "Vehicle information support")
+                .put("value", JSONObject.NULL).put("raw", infoSupportRaw).put("status", unavailableStatus(infoSupportRaw, 9)).put("error", "Mode 09 supported information unavailable; see raw responses."))
+            val allInfoPids = CapabilityDiscovery.pollOrder(infoSupport.supported)
+            val infoRotation = if (allInfoPids.isEmpty()) emptyList() else allInfoPids.drop(infoCursor % allInfoPids.size) + allInfoPids.take(infoCursor % allInfoPids.size)
+            for (pid in infoRotation) {
+                val raw = query("09%02X".format(pid))
+                if (allInfoPids.isNotEmpty()) infoCursor = (allInfoPids.indexOf(pid) + 1) % allInfoPids.size
+                val frames = ObdParser.frames(raw).filter { it.bytes.size > 2 && it.bytes.take(2) == listOf(0x49, pid) }
+                for ((ecu, advertised) in infoSupport.supported) {
+                    if (pid !in advertised) continue
+                    val matches = frames.filter { it.ecu == ecu }
+                    if (matches.isEmpty()) {
+                        val error = issue("Mode 09 PID %02X from %s".format(pid, ecu), raw)
+                        vehicleInfo.put(JSONObject().put("ecu", ecu).put("pid", "%02X".format(pid)).put("name", DiagnosticDecoder.vehicleInfoName(pid))
+                            .put("value", JSONObject.NULL).put("raw", raw).put("status", "read_failed").put("error", error))
+                    }
+                    matches.forEachIndexed { index, frame ->
+                        val bytes = frame.bytes.drop(2)
+                        val value = DiagnosticDecoder.vehicleInfo(pid, bytes, identifiedCan && ecu != "unidentified" && matches.size == 1)
+                        vehicleInfo.put(JSONObject().put("ecu", if (matches.size > 1) "$ecu response ${index + 1}" else ecu).put("pid", "%02X".format(pid))
+                            .put("name", DiagnosticDecoder.vehicleInfoName(pid)).put("value", value ?: JSONObject.NULL).put("raw", PidCatalogue.rawHex(bytes))
+                            .put("status", "fresh").put("error", if (value == null) "Raw information; no verified decoder or unambiguous source." else ""))
+                    }
+                }
+            }
+        } catch (e: DiagnosticBudgetException) {
+            errors.put(e.message)
+        }
+        ensureSession(token)
+        return JSONObject().put("readiness", readiness).put("freezeFrames", freezeFrames).put("vehicleInfo", vehicleInfo)
+            .put("errors", errors).put("complete", errors.length() == 0).put("updatedAt", System.currentTimeMillis()).put("rawResponses", rawResponses)
+    }
     private fun scanDtcs(): JSONObject {
         if (state != "connected") throw IOException("Connect to an ECU before scanning.")
         val codes = JSONArray()
@@ -403,7 +608,9 @@ class MainActivity : Activity() {
             val raw = command(request, 4000)
             result.put("mode$request", raw)
             if (!ObdParser.validDtcReply(raw, reply, countedDtcs)) {
-                errors.put("Mode $request: ${raw.take(120).ifEmpty { "No response" }}")
+                val unsupported = ObdParser.frames(raw).any { it.bytes.size >= 3 && it.bytes[0] == 0x7F && it.bytes[1] == request.toInt(16) && it.bytes[2] in listOf(0x11, 0x12) }
+                val reason = if (unsupported) "${if (request == "0A") "Permanent codes" else "$mode codes"}: unsupported by ECU" else "Read failed or incomplete"
+                errors.put("Mode $request: $reason (${raw.take(120).ifEmpty { "No response" }})")
                 continue
             }
             for (code in ObdParser.dtcs(raw, reply, countedDtcs)) codes.put(JSONObject().put("code", code).put("mode", mode).put("modeLabel", "Mode $request ${mode.lowercase()}"))
@@ -420,11 +627,17 @@ class MainActivity : Activity() {
             var newest = 0L
             for (key in listOf("speed", "rpm", "voltage", "voltMin", "coolant", "intake", "map", "baro", "throttle", "load", "maf", "stft", "o2B1S1", "o2B1S2")) {
                 val reading = readings[key]
-                val fresh = state == "connected" && reading != null && now - reading.at <= 10000
+                val fresh = state == "connected" && reading != null && now - reading.at <= if (key in listOf("rpm", "speed", "voltage", "voltMin")) 10000 else maxOf(10000L, pollPids.size * 7000L)
                 result.put(key, if (fresh) reading!!.value else JSONObject.NULL)
                 if (fresh) newest = maxOf(newest, reading!!.at)
             }
-            return result.put("updatedAt", newest).toString()
+            val capabilitySnapshot = capabilities
+            val capabilityErrors = JSONArray()
+            capabilitySnapshot.errors.forEach { capabilityErrors.put(it) }
+            return result.put("updatedAt", newest).put("parameters", parameterSnapshot()).put("capabilities", JSONObject()
+                .put("complete", capabilitySnapshot.errors.isEmpty() && capabilitySnapshot.supported.isNotEmpty())
+                .put("supportedCount", CapabilityDiscovery.pollOrder(capabilitySnapshot.supported).size)
+                .put("ecuIdentification", identifiedCan).put("errors", capabilityErrors)).toString()
         }
         @SuppressLint("MissingPermission")
         @JavascriptInterface fun listPairedDevices(): String {
@@ -443,12 +656,13 @@ class MainActivity : Activity() {
             worker.execute {
                 val result = JSONObject()
                 try {
-                    if (operation in listOf("scanDtc", "clearDtc") && generation.get() != requestGeneration) throw IOException("Operation cancelled because the connection changed.")
+                    if (operation in listOf("scanDtc", "clearDtc", "readDiagnostics") && generation.get() != requestGeneration) throw IOException("Operation cancelled because the connection changed.")
                     val data: Any = when (operation) {
                         "listDevices" -> JSONArray(listPairedDevices())
                         "connect" -> connect(argument.trim().uppercase(), requestGeneration)
                         "disconnect" -> "DISCONNECTED"
                         "scanDtc" -> scanDtcs()
+                        "readDiagnostics" -> readDiagnostics()
                         "clearDtc" -> {
                             if (state != "connected") throw IOException("Connect to an ECU before clearing codes.")
                             val response = command("04", 6000)

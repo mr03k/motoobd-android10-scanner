@@ -22,3 +22,9 @@ Keep the web and bundled HTML copies identical. There are no runtime CDN depende
 - Compare PID values and DTCs with a trusted scanner before relying on readings.
 
 Use `docs/REVIEW.md` for executed check evidence. Old loop-test claims are superseded; the original referenced test runner was absent from the repository.
+
+## 2.5 bridge additions
+
+`getLiveTelemetryJson()` now returns `parameters` (id, ecu, pid, name, unit, value or null, raw, status, supported, decoded, updatedAt, staleAfterMs, error) and `capabilities` (complete, supportedCount, errors), preserving compatibility dashboard fields.
+
+`requestOperation(id, "readDiagnostics", "")` returns readiness[], freezeFrames[], vehicleInfo[], errors[], rawResponses[], updatedAt and complete. Each record is source-labeled; diagnostics must not be reconstructed from current live readings. Mode01 metadata/capability discovery is reset on reconnect, and queued snapshot work is bound to its session. UI ignores callbacks from replaced sessions.

@@ -1,6 +1,6 @@
 {
   "name": "motoobd-android10-scanner",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "MotoOBD Android WebView regression checks",
   "scripts": {
     "test": "playwright test"

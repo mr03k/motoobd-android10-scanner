@@ -44,3 +44,13 @@ Legacy `deploy_*`, `fix_*`, and push scripts are retired stubs. Earlier versions
 ## Hardware limits
 
 No adapter or vehicle was available during the refactor. Classic/BLE compatibility, permission prompts on real Android 10/12+ devices, ECU timing, ignition-off behavior, and physical disconnect/reconnect remain field tests. BLE supports paired adapters exposing supported serial services and notifications; pairing/discovery happens in Android settings. Some BLE-only adapters cannot be paired that way and are not supported by this version.
+
+## Expanded capabilities (2.5)
+
+The fixed sensor loop is replaced by standard Mode 01 capability discovery. The scanner follows the supported-PID bitmap continuation chain through E0, polls every advertised non-bitmap PID, and preserves raw bytes for fields without a verified decoder. Fast dashboard readings get priority; remaining fields are rotated fairly. More supported fields mean longer refresh cycles. Each parameter carries its own timestamp and availability state.
+
+Use **All parameters** to search by PID, name or raw response and filter fresh, stale/failed and unsupported fields. Unsupported means the discovered bitmap excludes that PID; it is not inferred from a timeout. A failed discovery block leaves capability coverage incomplete.
+
+The **Diagnostic snapshot** reads supported readiness/MIL information, frame 00 freeze-frame data, and Mode 09 vehicle information. A zero freeze-frame trigger code is shown as no stored snapshot. Unsupported Mode 0A is explained in words rather than mistaken for a trouble code. Vehicle identifiers may appear in copied reports; review reports before sharing.
+
+Coverage is limited to standard OBD-II services advertised by the responding ECU(s). Proprietary manufacturer parameters, ABS/airbag modules, actuator tests, coding, service resets and additional manufacturer-specific freeze-frame records require separate validated definitions and are not probed. Unknown supported fields remain raw, not invented measurements.

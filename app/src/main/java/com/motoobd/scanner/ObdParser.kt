@@ -5,8 +5,11 @@ object ObdParser {
     private val hexLine = Regex("^[0-9A-F ]+$")
     private val canHeader = Regex("^(?:[0-9A-F]{3}|[0-9A-F]{8})$")
 
-    fun payloads(raw: String): List<List<Int>> {
-        val result = mutableListOf<List<Int>>()
+    data class Frame(val ecu: String, val bytes: List<Int>)
+    fun payloads(raw: String): List<List<Int>> = frames(raw).map { it.bytes }
+
+    fun frames(raw: String): List<Frame> {
+        val result = mutableListOf<Frame>()
         val segmented = linkedMapOf<String, MutableList<Int>>()
         val lengths = mutableMapOf<String, Int>()
         val sequences = mutableMapOf<String, Int>()
@@ -19,7 +22,7 @@ object ObdParser {
                 line = line.substring(label.value.length)
                 if (label.groupValues[1] == "0") {
                     numbered = mutableListOf()
-                    result.add(numbered)
+                    result.add(Frame("unidentified", numbered))
                 }
             }
             if (!hexLine.matches(line)) continue
@@ -39,7 +42,7 @@ object ObdParser {
                 when (bytes[0] shr 4) {
                     0 -> {
                         val length = bytes[0] and 15
-                        if (bytes.size >= length + 1) result.add(bytes.drop(1).take(length))
+                        if (bytes.size >= length + 1) result.add(Frame(ecu, bytes.drop(1).take(length)))
                     }
                     1 -> if (bytes.size >= 2) {
                         lengths[ecu] = ((bytes[0] and 15) shl 8) or bytes[1]
@@ -55,18 +58,18 @@ object ObdParser {
                         frame.addAll(bytes.drop(1))
                         sequences[ecu] = ((sequences[ecu] ?: 1) + 1) and 15
                     }
-                    else -> result.add(bytes)
+                    else -> result.add(Frame(ecu, bytes))
                 }
             } else if (label != null && numbered != null) {
                 numbered.addAll(bytes)
             } else {
                 // A 3-digit ELM message length and command echoes are not replies.
-                if (bytes.first() in 0x40..0x7F) result.add(bytes)
+                if (bytes.first() in 0x40..0x7F) result.add(Frame("unidentified", bytes))
             }
         }
         for ((ecu, bytes) in segmented) {
             val length = lengths[ecu] ?: continue
-            if (bytes.size >= length) result.add(bytes.take(length))
+            if (bytes.size >= length) result.add(Frame(ecu, bytes.take(length)))
         }
         return result
     }
@@ -78,7 +81,7 @@ object ObdParser {
     fun hasReply(raw: String, mode: Int): Boolean = payloads(raw).any { it.firstOrNull() == mode }
 
     fun hasNegativeReply(raw: String, requestedMode: Int): Boolean = payloads(raw)
-        .any { it.size >= 3 && it[0] == 0x7F && it[1] == requestedMode }
+        .any { it.size >= 3 && it[0] == 0x7F && it[1] == requestedMode && it[2] != 0x78 }
 
     fun validDtcReply(raw: String, mode: Int, counted: Boolean): Boolean {
         if (hasNegativeReply(raw, mode - 0x40)) return false

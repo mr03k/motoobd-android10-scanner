@@ -650,6 +650,120 @@
           max-width: 62%;
         }
       }
+
+      .parameter-controls {
+        display: grid;
+        grid-template-columns: 1fr minmax(140px, 0.45fr);
+        gap: 12px;
+        margin: 18px 0;
+      }
+      .parameter-list {
+        display: grid;
+        gap: 10px;
+        max-height: 600px;
+        overflow: auto;
+        padding: 4px;
+      }
+      .parameter-row {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        background: var(--bg);
+        min-width: 0;
+      }
+      .parameter-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      .parameter-name {
+        font-weight: 600;
+        font-size: 0.9rem;
+      }
+      .parameter-value {
+        font-variant-numeric: tabular-nums;
+        font-size: 1rem;
+        overflow-wrap: anywhere;
+        margin: 8px 0;
+      }
+      .parameter-meta {
+        font-size: 0.7rem;
+        color: var(--muted);
+        overflow-wrap: anywhere;
+      }
+      .parameter-row .tag {
+        white-space: normal;
+      }
+      .parameter-row[data-status="fresh"] .tag {
+        color: var(--accent);
+      }
+      .parameter-row[data-status="read_failed"] .tag,
+      .parameter-row[data-status="stale"] .tag {
+        color: var(--amber);
+      }
+      .diagnostic-group {
+        margin: 18px 0;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+      }
+      .diagnostic-group h3 {
+        margin-bottom: 12px;
+      }
+      .diagnostic-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      .monitor-row {
+        font-size: 0.8rem;
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 9px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .monitor-row strong {
+        font-weight: 500;
+        white-space: nowrap;
+      }
+      .diagnostic-raw {
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--muted);
+        font-size: 0.7rem;
+        margin-top: 8px;
+      }
+      .disclosure {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      .disclosure summary {
+        cursor: pointer;
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+      }
+      .parameter-controls select {
+        font: inherit;
+      }
+      .diagnostic-errors {
+        color: var(--amber);
+        font-size: 0.8rem;
+        padding-left: 20px;
+      }
+      @media (max-width: 700px) {
+        .parameter-controls,
+        .diagnostic-grid {
+          grid-template-columns: 1fr;
+        }
+        .parameter-top {
+          gap: 8px;
+        }
+        .parameter-name {
+          font-size: 0.85rem;
+        }
+      }
     </style>
   </head>
   <body>
@@ -737,6 +851,53 @@
         </div>
         <h2 class="section-label">Engine & electrical</h2>
         <div id="metricGrid" class="metric-grid"></div>
+        <section
+          class="panel"
+          style="margin-bottom: 24px"
+          aria-labelledby="parametersTitle"
+        >
+          <div class="section-top">
+            <div>
+              <h2 id="parametersTitle">All parameters</h2>
+              <p id="capabilitySummary">
+                Connect to discover the ECU's supported live parameters.
+              </p>
+            </div>
+            <span id="parameterCount" class="tag">0 shown</span>
+          </div>
+          <p class="small">
+            Supported Mode 01 parameters are polled in rotation. Values without
+            a verified decoder are shown as raw bytes. A failed read is not
+            evidence of a failed component. Standard units are used in this
+            list.
+          </p>
+          <div class="parameter-controls">
+            <div>
+              <label for="parameterSearch"
+                >Search name, PID, ECU or raw bytes</label
+              ><input
+                id="parameterSearch"
+                type="search"
+                class="control"
+                autocomplete="off"
+                placeholder="For example, fuel, 0C or 7E8"
+              />
+            </div>
+            <div>
+              <label for="parameterFilter">Show parameters</label
+              ><select id="parameterFilter" class="control">
+                <option value="supported">Supported</option>
+                <option value="all">All discovered</option>
+                <option value="fresh">Fresh readings</option>
+                <option value="unavailable">Unavailable / stale</option>
+                <option value="unsupported">Unsupported</option>
+              </select>
+            </div>
+          </div>
+          <p id="capabilityErrors" class="live-message" role="status"></p>
+          <div id="parameterList" class="parameter-list"></div>
+        </section>
+
         <div class="panel">
           <div class="section-top">
             <div>
@@ -802,6 +963,40 @@
             aria-live="polite"
           ></p>
         </div>
+
+        <section
+          class="panel"
+          style="margin-top: 20px"
+          aria-labelledby="diagnosticsTitle"
+        >
+          <div class="section-top">
+            <div>
+              <h2 id="diagnosticsTitle">Diagnostic snapshot</h2>
+              <p>Readiness, vehicle information & freeze frame</p>
+            </div>
+            <button id="diagnosticsButton" class="primary" disabled>
+              Read snapshot
+            </button>
+          </div>
+          <p class="small">
+            Reads supported standard services: Mode 01 readiness, Mode 09
+            vehicle information and Mode 02 freeze-frame 00. Availability varies
+            by ECU. This read does not erase data. VIN and calibration
+            identifiers may appear in the snapshot and copied report.
+          </p>
+          <p
+            id="diagnosticsMessage"
+            class="live-message"
+            role="status"
+            aria-live="polite"
+          ></p>
+          <div id="diagnosticsResults">
+            <div class="empty">
+              <h3>No snapshot yet</h3>
+              <p>Connect an adapter, then read a diagnostic snapshot.</p>
+            </div>
+          </div>
+        </section>
         <div class="panel" style="margin-top: 20px">
           <div class="section-top">
             <div>
@@ -1038,11 +1233,17 @@
           device: "",
           busy: false,
           scanPending: false,
+          diagnostics: null,
+          diagnosticsPending: false,
+          diagnosticsError: "",
+          diagnosticsDevice: "",
         };
         function clear(node) {
           while (node.firstChild) node.removeChild(node.firstChild);
         }
         const pending = new Map();
+        let sessionVersion = 0;
+        let diagnosticsRenderCache = null;
         let serial = 0,
           interval = null,
           demoTick = 0,
@@ -1068,9 +1269,736 @@
           ["rpm", "speed"].concat(metrics.map((m) => m.key)).forEach((key) => {
             result[key] = fresh ? number(input[key]) : null;
           });
+          result.parameters = normalizeParameters(input.parameters, now);
+          result.capabilities =
+            input.capabilities && typeof input.capabilities === "object"
+              ? input.capabilities
+              : null;
           result.updatedAt = number(input.updatedAt);
           return result;
         }
+
+        function normalizeParameters(input, now) {
+          if (!Array.isArray(input)) return [];
+          return input
+            .filter((p) => p && typeof p === "object")
+            .map((p, index) => {
+              const updatedAt = number(p.updatedAt),
+                supported = p.supported === true,
+                staleAfterMs =
+                  number(p.staleAfterMs) !== null && p.staleAfterMs > 0
+                    ? p.staleAfterMs
+                    : 10000;
+              let status =
+                typeof p.status === "string"
+                  ? p.status
+                  : supported
+                    ? "not_read"
+                    : "unsupported";
+              if (
+                status === "fresh" &&
+                (!updatedAt || now - updatedAt > staleAfterMs)
+              )
+                status = "stale";
+              return {
+                id: String(p.id || index),
+                ecu: String(p.ecu || "unidentified"),
+                pid: String(p.pid || "?"),
+                name: String(p.name || "Unmapped parameter"),
+                value:
+                  typeof p.value === "string" || number(p.value) !== null
+                    ? p.value
+                    : null,
+                unit: String(p.unit || ""),
+                raw: String(p.raw || ""),
+                status,
+                updatedAt,
+                staleAfterMs,
+                supported,
+                decoded: p.decoded === true,
+                error: String(p.error || ""),
+              };
+            });
+        }
+        function parameterStatus(parameter) {
+          if (
+            parameter.status === "fresh" &&
+            (!parameter.updatedAt ||
+              Date.now() - parameter.updatedAt >
+                (parameter.staleAfterMs || 10000))
+          )
+            return "stale";
+          return parameter.status;
+        }
+        function statusLabel(status) {
+          return (
+            {
+              fresh: "Fresh",
+              stale: "Stale",
+              read_failed: "Read failed",
+              unsupported: "Unsupported",
+              not_read: "Not read",
+              not_polled: "Not polled",
+            }[status] || String(status || "Unavailable").replace(/_/g, " ")
+          );
+        }
+        function displayParameterValue(parameter, isSnapshot) {
+          const fresh = isSnapshot || parameterStatus(parameter) === "fresh";
+          if (!parameter.decoded)
+            return parameter.raw ? "Raw bytes · no verified decoder" : "—";
+          if (
+            !fresh ||
+            (isSnapshot &&
+              !["fresh", "stale", "ok", "success"].includes(
+                parameter.status,
+              )) ||
+            parameter.value === null ||
+            parameter.value === undefined
+          )
+            return "—";
+          return (
+            (typeof parameter.value === "number"
+              ? parameter.value.toLocaleString("en-US", {
+                  maximumFractionDigits: 4,
+                })
+              : parameter.value) + (parameter.unit ? " " + parameter.unit : "")
+          );
+        }
+        function parameterRow(parameter, snapshot) {
+          const status = snapshot
+              ? parameter.status
+              : parameterStatus(parameter),
+            row = el("article", "parameter-row");
+          row.dataset.status = status;
+          const top = el("div", "parameter-top");
+          top.appendChild(el("h3", "parameter-name", parameter.name));
+          top.appendChild(
+            el(
+              "span",
+              "tag",
+              snapshot && status === "fresh"
+                ? "Snapshot reading"
+                : statusLabel(status),
+            ),
+          );
+          row.appendChild(top);
+          row.appendChild(
+            el(
+              "div",
+              "parameter-value mono",
+              displayParameterValue(parameter, snapshot),
+            ),
+          );
+          row.appendChild(
+            el(
+              "p",
+              "parameter-meta",
+              "PID " +
+                parameter.pid +
+                " · ECU " +
+                parameter.ecu +
+                " · " +
+                (parameter.supported
+                  ? "Advertised supported"
+                  : "Not advertised supported"),
+            ),
+          );
+          row.appendChild(
+            el(
+              "p",
+              "parameter-meta",
+              (status === "read_failed"
+                ? "Last read attempt: "
+                : "Last successful read: ") +
+                (parameter.updatedAt
+                  ? new Date(parameter.updatedAt).toLocaleString()
+                  : "none"),
+            ),
+          );
+          if (parameter.raw)
+            row.appendChild(
+              el("p", "diagnostic-raw mono", "Raw: " + parameter.raw),
+            );
+          if (parameter.error)
+            row.appendChild(el("p", "parameter-meta", parameter.error));
+          return row;
+        }
+        function renderParameters() {
+          const parameters = Array.isArray(state.telemetry.parameters)
+              ? state.telemetry.parameters
+              : [],
+            query = $("parameterSearch").value.trim().toUpperCase(),
+            filter = $("parameterFilter").value,
+            caps = state.telemetry.capabilities;
+          let supported = parameters.filter((p) => p.supported).length;
+          $("capabilitySummary").textContent = state.demo
+            ? "Simulated catalog · " +
+              supported +
+              " example supported parameters"
+            : caps
+              ? (caps.complete
+                  ? "Discovery complete"
+                  : "Discovery incomplete") +
+                " · " +
+                supported +
+                " supported responses in the catalog"
+              : state.connected
+                ? "Waiting for supported-parameter discovery."
+                : "Connect to discover the ECU's supported live parameters.";
+          $("capabilityErrors").textContent =
+            caps && Array.isArray(caps.errors) ? caps.errors.join(" ") : "";
+          const list = parameters.filter((p) => {
+            const status = parameterStatus(p);
+            return (
+              (filter === "all" ||
+                (filter === "supported" && p.supported) ||
+                (filter === "fresh" && status === "fresh") ||
+                (filter === "unavailable" &&
+                  p.supported &&
+                  status !== "fresh") ||
+                (filter === "unsupported" && !p.supported)) &&
+              (!query ||
+                [p.name, p.pid, p.ecu, p.raw]
+                  .join(" ")
+                  .toUpperCase()
+                  .includes(query))
+            );
+          });
+          $("parameterCount").textContent = list.length + " shown";
+          const previousScroll = $("parameterList").scrollTop;
+          clear($("parameterList"));
+          if (!list.length) {
+            const empty = el("div", "empty");
+            empty.appendChild(
+              el(
+                "h3",
+                "",
+                parameters.length
+                  ? "No matching parameters"
+                  : "No parameter catalog yet",
+              ),
+            );
+            empty.appendChild(
+              el(
+                "p",
+                "",
+                parameters.length
+                  ? "Try another search or change the parameter filter."
+                  : "Supported PID discovery runs when the adapter connects. A missing reading is not a zero.",
+              ),
+            );
+            $("parameterList").appendChild(empty);
+            return;
+          }
+          const fragment = document.createDocumentFragment();
+          list.forEach((p) => fragment.appendChild(parameterRow(p, false)));
+          $("parameterList").appendChild(fragment);
+          $("parameterList").scrollTop = previousScroll;
+        }
+        function diagnosticGroup(title) {
+          const group = el("section", "diagnostic-group");
+          group.appendChild(el("h3", "", title));
+          return group;
+        }
+        function diagnosticLine(group, label, value) {
+          const row = el("div", "monitor-row");
+          row.appendChild(el("span", "", label));
+          row.appendChild(el("strong", "", value));
+          group.appendChild(row);
+        }
+        function rawDetails(group, raw) {
+          if (!raw) return;
+          const details = el("details", "disclosure");
+          details.appendChild(el("summary", "", "Show raw response"));
+          details.appendChild(el("pre", "diagnostic-raw mono", String(raw)));
+          group.appendChild(details);
+        }
+        function diagnosticsPartial(data) {
+          return (
+            data.complete !== true ||
+            (Array.isArray(data.errors) && data.errors.length > 0)
+          );
+        }
+        function renderDiagnostics() {
+          const key = [
+            state.diagnostics,
+            state.diagnosticsPending,
+            state.connected,
+            state.demo,
+            state.diagnosticsError,
+            state.diagnosticsDevice,
+          ];
+          if (
+            diagnosticsRenderCache &&
+            key.every((value, index) => value === diagnosticsRenderCache[index])
+          )
+            return;
+          diagnosticsRenderCache = key;
+          const target = $("diagnosticsResults");
+          clear(target);
+          if (state.diagnosticsPending) {
+            const busy = el("div", "empty");
+            busy.appendChild(el("h3", "", "Reading diagnostic services…"));
+            busy.appendChild(
+              el(
+                "p",
+                "",
+                "This can take up to two minutes on slower adapters. Live polling pauses during the read.",
+              ),
+            );
+            target.appendChild(busy);
+            return;
+          }
+          const data = state.diagnostics;
+          if (!data) {
+            const empty = el("div", "empty");
+            empty.appendChild(el("h3", "", "No snapshot yet"));
+            empty.appendChild(
+              el(
+                "p",
+                "",
+                "Connect an adapter, then read a diagnostic snapshot.",
+              ),
+            );
+            target.appendChild(empty);
+            return;
+          }
+          const stamp = number(data.updatedAt);
+          target.appendChild(
+            el(
+              "p",
+              "stat-line",
+              (state.demo
+                ? "SIMULATED · "
+                : diagnosticsPartial(data)
+                  ? "Partial snapshot · "
+                  : "Diagnostic snapshot · ") +
+                (stamp
+                  ? new Date(stamp).toLocaleString()
+                  : "Time unavailable") +
+                (!state.connected && !state.demo
+                  ? " · previous connection"
+                  : "") +
+                " · " +
+                (state.diagnosticsDevice || "Adapter unavailable"),
+            ),
+          );
+          if (state.diagnosticsError)
+            target.appendChild(
+              el(
+                "p",
+                "notice",
+                "Latest read failed. Previous snapshot retained: " +
+                  state.diagnosticsError,
+              ),
+            );
+          if (Array.isArray(data.errors) && data.errors.length) {
+            const errors = el("ul", "diagnostic-errors");
+            data.errors.forEach((error) =>
+              errors.appendChild(el("li", "", String(error))),
+            );
+            target.appendChild(errors);
+          }
+          const readiness = diagnosticGroup(
+            "Readiness & malfunction indicator",
+          );
+          readiness.appendChild(
+            el(
+              "p",
+              "small",
+              "Readiness describes whether emissions tests have run since codes were cleared. Complete does not establish component health.",
+            ),
+          );
+          if (!Array.isArray(data.readiness) || !data.readiness.length)
+            readiness.appendChild(
+              el(
+                "p",
+                "small",
+                "Readiness unavailable. No MIL or monitor conclusion is available.",
+              ),
+            );
+          (Array.isArray(data.readiness) ? data.readiness : []).forEach(
+            (item) => {
+              const card = el("div", "parameter-row");
+              card.appendChild(
+                el(
+                  "h3",
+                  "parameter-name",
+                  "ECU " + (item.ecu || "unidentified"),
+                ),
+              );
+              const valid =
+                item.status === "fresh" ||
+                item.status === "ok" ||
+                item.status === "success";
+              diagnosticLine(
+                card,
+                "Malfunction indicator",
+                valid && typeof item.mil === "boolean"
+                  ? item.mil
+                    ? "On"
+                    : "Off"
+                  : "Unavailable",
+              );
+              diagnosticLine(
+                card,
+                "Reported DTC count",
+                valid && number(item.dtcCount) !== null
+                  ? String(item.dtcCount)
+                  : "Unavailable",
+              );
+              diagnosticLine(
+                card,
+                "Ignition type",
+                item.ignitionType || "Unavailable",
+              );
+              (Array.isArray(item.monitors) ? item.monitors : []).forEach((m) =>
+                diagnosticLine(
+                  card,
+                  String(m.name || "Monitor"),
+                  !m.supported
+                    ? "Unsupported"
+                    : typeof m.complete === "boolean"
+                      ? m.complete
+                        ? "Complete"
+                        : "Incomplete"
+                      : "Unavailable",
+                ),
+              );
+              if (item.error)
+                card.appendChild(el("p", "small", String(item.error)));
+              rawDetails(card, item.raw);
+              readiness.appendChild(card);
+            },
+          );
+          target.appendChild(readiness);
+          const info = diagnosticGroup("Vehicle information · Mode 09");
+          info.appendChild(
+            el(
+              "p",
+              "small",
+              "Identifiers are reported by each ECU. Unknown ECU labels do not establish that responses came from the same module.",
+            ),
+          );
+          if (!Array.isArray(data.vehicleInfo) || !data.vehicleInfo.length)
+            info.appendChild(
+              el(
+                "p",
+                "small",
+                "No supported vehicle identifiers were returned.",
+              ),
+            );
+          (Array.isArray(data.vehicleInfo) ? data.vehicleInfo : []).forEach(
+            (item) => {
+              const card = el("article", "parameter-row");
+              card.dataset.status = String(item.status || "unavailable");
+              card.appendChild(
+                el(
+                  "h3",
+                  "parameter-name",
+                  String(item.name || "Vehicle information"),
+                ),
+              );
+              card.appendChild(
+                el(
+                  "p",
+                  "parameter-value mono",
+                  item.value !== null &&
+                    item.value !== undefined &&
+                    item.value !== ""
+                    ? String(item.value)
+                    : "Unavailable",
+                ),
+              );
+              card.appendChild(
+                el(
+                  "p",
+                  "parameter-meta",
+                  "PID " +
+                    (item.pid || "?") +
+                    " · ECU " +
+                    (item.ecu || "unidentified") +
+                    " · " +
+                    statusLabel(item.status),
+                ),
+              );
+              if (item.error)
+                card.appendChild(el("p", "small", String(item.error)));
+              rawDetails(card, item.raw);
+              info.appendChild(card);
+            },
+          );
+          target.appendChild(info);
+          const frames = diagnosticGroup("Freeze frame · Mode 02, frame 00");
+          frames.appendChild(
+            el(
+              "p",
+              "small",
+              "This is the ECU's stored snapshot, not current live data. Other frame numbers and manufacturer-specific records are not requested.",
+            ),
+          );
+          if (!Array.isArray(data.freezeFrames) || !data.freezeFrames.length)
+            frames.appendChild(
+              el("p", "small", "No freeze-frame response available."),
+            );
+          (Array.isArray(data.freezeFrames) ? data.freezeFrames : []).forEach(
+            (frame) => {
+              const card = el("section", "parameter-row");
+              card.appendChild(
+                el(
+                  "h3",
+                  "parameter-name",
+                  "ECU " +
+                    (frame.ecu || "unidentified") +
+                    " · frame " +
+                    (frame.frame === undefined ? "00" : frame.frame),
+                ),
+              );
+              if (frame.dtc)
+                card.appendChild(
+                  el("p", "parameter-value mono", "Trigger code: " + frame.dtc),
+                );
+              else
+                card.appendChild(
+                  el(
+                    "p",
+                    "small",
+                    frame.status === "no_frame" || frame.status === "empty"
+                      ? "No freeze frame stored."
+                      : "Trigger code unavailable.",
+                  ),
+                );
+              if (frame.error)
+                card.appendChild(el("p", "small", String(frame.error)));
+              const parameters =
+                frame.status === "no_frame" || frame.status === "empty"
+                  ? []
+                  : normalizeParameters(frame.parameters, 0);
+              if (parameters.length) {
+                const grid = el("div", "diagnostic-grid");
+                parameters.forEach((p) =>
+                  grid.appendChild(parameterRow(p, true)),
+                );
+                card.appendChild(grid);
+              }
+              rawDetails(card, frame.raw);
+              frames.appendChild(card);
+            },
+          );
+          target.appendChild(frames);
+          if (Array.isArray(data.rawResponses) && data.rawResponses.length) {
+            const transcript = diagnosticGroup("Diagnostic service transcript");
+            rawDetails(
+              transcript,
+              data.rawResponses
+                .map(
+                  (item) =>
+                    String(item.request || "?") +
+                    " → " +
+                    String(item.response || "No response"),
+                )
+                .join("\n\n"),
+            );
+            target.appendChild(transcript);
+          }
+        }
+        function demoParameters() {
+          const now = Date.now();
+          return [
+            {
+              id: "7E8:0C",
+              ecu: "7E8",
+              pid: "0C",
+              name: "Engine speed",
+              value: state.telemetry.rpm,
+              unit: "rpm",
+              raw: "1A F8",
+              status: "fresh",
+              updatedAt: now,
+              supported: true,
+              decoded: true,
+              error: "",
+            },
+            {
+              id: "7E8:0D",
+              ecu: "7E8",
+              pid: "0D",
+              name: "Vehicle speed",
+              value: state.telemetry.speed,
+              unit: "km/h",
+              raw: "26",
+              status: "fresh",
+              updatedAt: now,
+              supported: true,
+              decoded: true,
+              error: "",
+            },
+            {
+              id: "7E8:05",
+              ecu: "7E8",
+              pid: "05",
+              name: "Engine coolant temperature",
+              value: 87,
+              unit: "°C",
+              raw: "7F",
+              status: "fresh",
+              updatedAt: now,
+              supported: true,
+              decoded: true,
+              error: "",
+            },
+            {
+              id: "7E8:99",
+              ecu: "7E8",
+              pid: "99",
+              name: "Supported raw parameter 99",
+              value: null,
+              unit: "",
+              raw: "01 02 03 04",
+              status: "fresh",
+              updatedAt: now,
+              supported: true,
+              decoded: false,
+              error: "",
+            },
+            {
+              id: "7E8:3C",
+              ecu: "7E8",
+              pid: "3C",
+              name: "Catalyst temperature · Bank 1, Sensor 1",
+              value: null,
+              unit: "°C",
+              raw: "",
+              status: "unsupported",
+              updatedAt: null,
+              supported: false,
+              decoded: true,
+              error: "Not advertised by this example ECU.",
+            },
+          ];
+        }
+        function demoDiagnostics() {
+          const now = Date.now();
+          return {
+            complete: true,
+            updatedAt: now,
+            errors: [],
+            readiness: [
+              {
+                ecu: "7E8",
+                mil: true,
+                dtcCount: 1,
+                ignitionType: "Spark ignition",
+                status: "fresh",
+                raw: "81 07 E5 00",
+                monitors: [
+                  {
+                    name: "Misfire monitoring",
+                    supported: true,
+                    complete: true,
+                  },
+                  {
+                    name: "Catalyst monitoring",
+                    supported: true,
+                    complete: false,
+                  },
+                  {
+                    name: "Evaporative system",
+                    supported: false,
+                    complete: null,
+                  },
+                ],
+              },
+            ],
+            vehicleInfo: [
+              {
+                ecu: "7E8",
+                pid: "04",
+                name: "Example calibration identifier",
+                value: "DEMO-CAL-001",
+                raw: "44 45 4D 4F",
+                status: "fresh",
+                error: "",
+              },
+            ],
+            freezeFrames: [
+              {
+                frame: 0,
+                ecu: "7E8",
+                dtc: "P0300",
+                status: "fresh",
+                parameters: [
+                  {
+                    id: "7E8:0C",
+                    ecu: "7E8",
+                    pid: "0C",
+                    name: "Engine speed",
+                    value: 1840,
+                    unit: "rpm",
+                    raw: "1C C0",
+                    status: "fresh",
+                    updatedAt: now,
+                    supported: true,
+                    decoded: true,
+                    error: "",
+                  },
+                ],
+              },
+            ],
+          };
+        }
+        async function readDiagnostics() {
+          if (state.busy || (!state.connected && !state.demo)) return;
+          state.busy = true;
+          state.diagnosticsPending = true;
+          state.diagnosticsError = "";
+          render();
+          setMessage(
+            "diagnosticsMessage",
+            "Reading readiness, vehicle information and freeze-frame 00…",
+          );
+          const device = state.device,
+            demo = state.demo,
+            version = sessionVersion;
+          try {
+            let result = demo
+              ? demoDiagnostics()
+              : await request("readDiagnostics");
+            if (typeof result === "string") result = JSON.parse(result);
+            if (!result || typeof result !== "object" || result.error)
+              throw new Error(
+                (result && result.error) || "No diagnostic snapshot received.",
+              );
+            if (version !== sessionVersion)
+              throw new Error(
+                "Diagnostic read cancelled because the adapter session changed.",
+              );
+            if (!demo && !state.connected)
+              throw new Error(
+                "The adapter disconnected during the diagnostic read.",
+              );
+            state.diagnostics = result;
+            state.diagnosticsDevice = device;
+            setMessage(
+              "diagnosticsMessage",
+              demo
+                ? "Example snapshot · simulated data only."
+                : diagnosticsPartial(result)
+                  ? "Partial snapshot. Review unavailable services below; no conclusion is available for missing data."
+                  : "Snapshot read complete. Readiness reports test completion, not component health.",
+              diagnosticsPartial(result),
+            );
+          } catch (error) {
+            if (version !== sessionVersion) return;
+            state.diagnosticsError = error.message;
+            setMessage("diagnosticsMessage", error.message, true);
+          } finally {
+            state.busy = false;
+            state.diagnosticsPending = false;
+            render();
+          }
+        }
+
         function valueFor(key, value) {
           if (number(value) === null) return null;
           if (state.imperial && (key === "coolant" || key === "intake"))
@@ -1115,7 +2043,11 @@
                     ),
                   );
                 },
-                operation === "connect" ? 75000 : 30000,
+                operation === "connect"
+                  ? 75000
+                  : operation === "readDiagnostics"
+                    ? 150000
+                    : 30000,
               );
             pending.set(id, { resolve, reject, timeout });
             try {
@@ -1222,11 +2154,13 @@
             ? "Simulated session · explore the dashboard"
             : state.paused
               ? "View paused · the adapter session remains connected"
-              : state.connected
-                ? "Live measurements from your connected adapter."
-                : state.connecting
-                  ? "Connecting to your adapter…"
-                  : "Connect an adapter to see measured engine data.";
+              : state.diagnosticsPending || state.scanPending
+                ? "Polling paused for a diagnostic read · cached readings expire when stale"
+                : state.connected
+                  ? "Live measurements from your connected adapter."
+                  : state.connecting
+                    ? "Connecting to your adapter…"
+                    : "Connect an adapter to see measured engine data.";
           [
             ["rpm", 0],
             ["speed", 0],
@@ -1268,12 +2202,19 @@
               (state.paused ? " · view paused" : "")
             : "Waiting for fresh data";
           $("scanButton").disabled = !active || state.busy;
+          $("diagnosticsButton").disabled = !active || state.busy;
+          $("diagnosticsButton").textContent = state.diagnosticsPending
+            ? "Reading snapshot…"
+            : "Read snapshot";
           $("clearButton").disabled =
             !state.connected || state.demo || state.busy;
-          $("reportButton").disabled = !active && !state.scanned;
-          $("faultReportButton").disabled = !state.scanned;
+          $("reportButton").disabled =
+            !active && !state.scanned && !state.diagnostics;
+          $("faultReportButton").disabled =
+            !state.scanned && !state.diagnostics;
           $("disconnectButton").hidden = !active;
-          $("disconnectButton").disabled = state.busy;
+          $("disconnectButton").disabled =
+            state.busy && !state.diagnosticsPending && !state.scanPending;
           $("disconnectButton").textContent = state.demo
             ? "End demo"
             : "Disconnect";
@@ -1298,6 +2239,8 @@
               : "Connect your paired Bluetooth OBD-II adapter.";
           $("sampleCount").textContent =
             state.history.filter((p) => p.rpm !== null).length + " samples";
+          renderParameters();
+          renderDiagnostics();
           drawChart();
         }
         function drawChart() {
@@ -1374,7 +2317,12 @@
           );
         }
         function clearSession() {
+          sessionVersion++;
           state.telemetry = {};
+          state.diagnostics = null;
+          state.diagnosticsError = "";
+          state.diagnosticsDevice = "";
+          setMessage("diagnosticsMessage", "");
           state.history = [];
           state.codes = [];
           state.scanned = false;
@@ -1428,6 +2376,15 @@
             maf: 6.4,
             stft: 2.3,
             updatedAt: Date.now(),
+          };
+          state.telemetry.parameters = demoParameters();
+          state.telemetry.capabilities = {
+            complete: true,
+            supportedCount: state.telemetry.parameters.filter(
+              (p) => p.supported,
+            ).length,
+            errors: [],
+            ecuIdentification: true,
           };
           addHistory();
           render();
@@ -1557,11 +2514,13 @@
           }
         }
         async function disconnect() {
-          if (state.busy) return;
+          if (state.busy && !state.diagnosticsPending && !state.scanPending)
+            return;
           if (state.demo) {
             stopDemo();
             return;
           }
+          sessionVersion++;
           state.busy = true;
           render();
           try {
@@ -1607,6 +2566,7 @@
           if (state.busy || (!state.connected && !state.demo)) return;
           state.busy = true;
           state.scanPending = true;
+          const version = sessionVersion;
           render();
           setMessage(
             "scanMessage",
@@ -1630,6 +2590,10 @@
                   (result && result.error) || "No scan response received.",
                 );
             }
+            if (version !== sessionVersion)
+              throw new Error(
+                "Scan cancelled because the adapter session changed.",
+              );
             state.codes = normalizeCodes(result.codes);
             state.scanned = true;
             state.scanTime = Date.now();
@@ -1653,6 +2617,7 @@
               state.scanPartial,
             );
           } catch (error) {
+            if (version !== sessionVersion) return;
             state.lastScanError = error.message;
             setMessage("scanMessage", error.message, true);
             $("scanHeading").textContent = "Scan could not finish";
@@ -1854,6 +2819,13 @@
                   "The ECU did not confirm the clear request.",
               );
             state.codes = [];
+            state.diagnostics = null;
+            state.diagnosticsError = "";
+            state.diagnosticsDevice = "";
+            setMessage(
+              "diagnosticsMessage",
+              "Diagnostic snapshot cleared locally. Read again: readiness and freeze-frame data may have changed after the clear request.",
+            );
             state.scanned = false;
             state.scanTime = null;
             state.scanPartial = false;
@@ -1947,6 +2919,183 @@
             "",
             "Missing readings are shown as a dash. This report does not establish vehicle condition.",
           );
+
+          lines.push("", "All live parameters · standard units");
+          const liveParameters = Array.isArray(state.telemetry.parameters)
+            ? state.telemetry.parameters
+            : [];
+          if (!liveParameters.length)
+            lines.push("No parameter catalog received.");
+          liveParameters.forEach((parameter) =>
+            lines.push(
+              "ECU " +
+                parameter.ecu +
+                " / PID " +
+                parameter.pid +
+                " / " +
+                parameter.name +
+                ": " +
+                displayParameterValue(parameter, false) +
+                " | status=" +
+                parameterStatus(parameter) +
+                " | supported=" +
+                parameter.supported +
+                " | decoded=" +
+                parameter.decoded +
+                " | raw=" +
+                (parameter.raw || "none") +
+                (parameterStatus(parameter) === "read_failed"
+                  ? " | lastReadAttempt="
+                  : " | lastSuccessfulRead=") +
+                (parameter.updatedAt
+                  ? new Date(parameter.updatedAt).toISOString()
+                  : "none") +
+                (parameter.error ? " | error=" + parameter.error : ""),
+            ),
+          );
+          if (state.telemetry.capabilities) {
+            lines.push(
+              "Capability discovery: " +
+                (state.telemetry.capabilities.complete
+                  ? "complete"
+                  : "incomplete"),
+            );
+            (Array.isArray(state.telemetry.capabilities.errors)
+              ? state.telemetry.capabilities.errors
+              : []
+            ).forEach((error) => lines.push("Discovery unavailable: " + error));
+          }
+          lines.push("", "Diagnostic snapshot");
+          const snapshot = state.diagnostics;
+          if (!snapshot)
+            lines.push("Not read or invalidated after clearing codes.");
+          else {
+            lines.push(
+              (state.demo ? "SIMULATED DEMO · " : "") +
+                "Snapshot read: " +
+                (number(snapshot.updatedAt) !== null
+                  ? new Date(snapshot.updatedAt).toISOString()
+                  : "unknown") +
+                " | adapter=" +
+                state.diagnosticsDevice +
+                " | " +
+                (diagnosticsPartial(snapshot) ? "partial" : "complete"),
+            );
+            if (state.diagnosticsError)
+              lines.push(
+                "Latest snapshot attempt failed; prior snapshot retained: " +
+                  state.diagnosticsError,
+              );
+            (Array.isArray(snapshot.errors) ? snapshot.errors : []).forEach(
+              (error) => lines.push("Unavailable: " + error),
+            );
+            (Array.isArray(snapshot.readiness)
+              ? snapshot.readiness
+              : []
+            ).forEach((item) => {
+              lines.push(
+                "Readiness since clear / ECU " +
+                  (item.ecu || "unidentified") +
+                  " | status=" +
+                  item.status +
+                  " | MIL=" +
+                  (typeof item.mil === "boolean"
+                    ? item.mil
+                      ? "on"
+                      : "off"
+                    : "unavailable") +
+                  " | DTC count=" +
+                  (number(item.dtcCount) !== null
+                    ? item.dtcCount
+                    : "unavailable") +
+                  " | ignition=" +
+                  (item.ignitionType || "unavailable") +
+                  " | raw=" +
+                  (item.raw || "none"),
+              );
+              (Array.isArray(item.monitors) ? item.monitors : []).forEach((m) =>
+                lines.push(
+                  "Monitor " +
+                    m.name +
+                    ": " +
+                    (!m.supported
+                      ? "unsupported"
+                      : typeof m.complete === "boolean"
+                        ? m.complete
+                          ? "complete"
+                          : "incomplete"
+                        : "unavailable"),
+                ),
+              );
+              if (item.error) lines.push("Readiness error: " + item.error);
+            });
+            (Array.isArray(snapshot.vehicleInfo)
+              ? snapshot.vehicleInfo
+              : []
+            ).forEach((item) =>
+              lines.push(
+                "Mode09 / ECU " +
+                  (item.ecu || "unidentified") +
+                  " / PID " +
+                  (item.pid || "?") +
+                  " / " +
+                  (item.name || "identifier") +
+                  ": " +
+                  (item.value === null || item.value === undefined
+                    ? "unavailable"
+                    : item.value) +
+                  " | status=" +
+                  item.status +
+                  " | raw=" +
+                  (item.raw || "none") +
+                  (item.error ? " | error=" + item.error : ""),
+              ),
+            );
+            (Array.isArray(snapshot.rawResponses)
+              ? snapshot.rawResponses
+              : []
+            ).forEach((item) =>
+              lines.push(
+                "Request " + item.request + " raw response: " + item.response,
+              ),
+            );
+            (Array.isArray(snapshot.freezeFrames)
+              ? snapshot.freezeFrames
+              : []
+            ).forEach((frame) => {
+              lines.push(
+                "Freeze frame " +
+                  frame.frame +
+                  " / ECU " +
+                  (frame.ecu || "unidentified") +
+                  " | trigger=" +
+                  (frame.dtc || "none returned") +
+                  " | status=" +
+                  frame.status +
+                  (frame.error ? " | error=" + frame.error : ""),
+              );
+              if (frame.status !== "no_frame")
+                normalizeParameters(frame.parameters, 0).forEach((parameter) =>
+                  lines.push(
+                    "Snapshot PID " +
+                      parameter.pid +
+                      " / " +
+                      parameter.name +
+                      ": " +
+                      displayParameterValue(parameter, true) +
+                      " | raw=" +
+                      (parameter.raw || "none") +
+                      " | status=" +
+                      parameter.status +
+                      " | read=" +
+                      (parameter.updatedAt
+                        ? new Date(parameter.updatedAt).toISOString()
+                        : "unknown"),
+                  ),
+                );
+            });
+          }
+
           const textarea = el("textarea", "control");
           textarea.readOnly = true;
           textarea.value = lines.join("\n");
@@ -1987,7 +3136,7 @@
             updateDemo();
             return;
           }
-          if (!native || state.connecting || state.scanPending) return;
+          if (!native || state.connecting) return;
           try {
             const connection = JSON.parse(bridge.getConnectionStateJson());
             if (
@@ -1997,6 +3146,19 @@
               const wasConnected = state.connected;
               state.connected = connection.connected;
               if (!state.connected) {
+                sessionVersion++;
+                if (state.diagnosticsPending)
+                  setMessage(
+                    "diagnosticsMessage",
+                    "Diagnostic read cancelled: the adapter disconnected.",
+                    true,
+                  );
+                if (state.scanPending)
+                  setMessage(
+                    "scanMessage",
+                    "Scan cancelled: the adapter disconnected.",
+                    true,
+                  );
                 state.telemetry = {};
                 state.history = [];
                 state.paused = false;
@@ -2048,6 +3210,9 @@
         $("demoButton").addEventListener("click", startDemo);
         $("disconnectButton").addEventListener("click", disconnect);
         $("scanButton").addEventListener("click", scan);
+        $("diagnosticsButton").addEventListener("click", readDiagnostics);
+        $("parameterSearch").addEventListener("input", renderParameters);
+        $("parameterFilter").addEventListener("change", renderParameters);
         $("clearButton").addEventListener("click", reviewClear);
         $("reportButton").addEventListener("click", report);
         $("faultReportButton").addEventListener("click", report);
@@ -2105,6 +3270,9 @@
         });
         window.MotoObd = {
           normalizeTelemetry,
+          normalizeParameters,
+          parameterStatus,
+          displayParameterValue,
           normalizeCodes,
           formatValue,
           state,

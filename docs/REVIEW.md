@@ -42,3 +42,17 @@ Reviewed baseline: `1e8216f6ffc9b908d3d3a517c472a24343ef40a0`. Work used an Andr
 No physical Android device, ELM327 adapter or vehicle was attached. Real Classic/BLE throughput and compatibility, TalkBack/system font behavior, permission revocation, foreground/background timing, ECU protocol timings and hardware clear behavior still require the acceptance checklist in HANDOFF.md. Never clear real ECU codes solely to test this build. Debug signing differs from any existing installation unless it used this same key; Android may reject an in-place update. Preserve any app data before replacing an installation.
 
 Target SDK stays at 34; compile SDK moves to 35 with a supported pinned AGP/Gradle pair. Store publication and signed production release are outside this change.
+
+## Capability and diagnostic expansion — 2.5.0
+
+Mode 01 discovery follows support masks from 00 through E0, preserves per-responder ranges, and schedules every advertised non-bitmap PID. A conservative catalogue decodes common standard values; unknown payloads remain raw. Unsupported is only inferred from a successfully received bitmap range. Missing continuation pages remain incomplete coverage. CAN responder identity is retained; ambiguous legacy responses are labeled rather than combined into an invented ECU.
+
+The parameter browser exposes per-PID sample time, raw bytes, support/decoder availability and fresh/stale/read-failed status. The freshness interval accounts for long polling sweeps. Broad coverage trades refresh rate for completeness; the dashboard is not a scope or a cylinder compression tester.
+
+Read-only snapshot operations add MIL/DTC count and spark/compression-ignition readiness, frame 00 trigger code and supported frozen parameters, and Mode 09 advertised vehicle data. Unknown records are raw. Mode02 no-frame is explicitly different from unsupported and failed reads. Diagnostic operations have a time budget, return incomplete coverage when exhausted, and can be interrupted by disconnect. Clear invalidates the prior snapshot. Exports preserve snapshot times and raw replies, and can contain VIN or other vehicle identifiers.
+
+References: ELM Electronics ELM327 datasheet (https://www.elmelectronics.com/wp-content/uploads/2016/07/ELM327DS.pdf), Au Electronics OBD simulator service examples (https://www.auelectronics.com/downloads/usermanual_simobd2can.pdf). Manufacturer-specific diagnostics and additional freeze-frame indices remain outside validated coverage.
+
+The user's KONNWEI report establishes that the previous build received live values from their adapter; it does not validate this expanded build. No adapter is attached to this development environment. Field validation is still required for discovery coverage, multiple ECU attribution, broad-PID refresh timing, readiness and freeze-frame decoding on the user's ECU.
+
+Executed expansion checks: 24 JVM tests passed (12 original parser + 6 capability discovery + 6 catalogue/readiness/information decoders). 22 Playwright tests passed, including per-PID freshness, unsupported/failed/raw states, stored snapshot export, no-frame handling, clear invalidation, late callback rejection and persistent raw disclosures. Phone/tablet renders inspected at 412/768px; responsive suite also covers320/1280px. Kotlin compiled, local debug packaging passed, bundled asset verified against source. Full lint/normal signing-validation remain CI checks because of the previously documented Windows File.canWrite sandbox issue.

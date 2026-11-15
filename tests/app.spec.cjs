@@ -75,7 +75,14 @@ async function load(page, options = {}) {
           response.data = m.clearFailure
             ? { success: false, error: "ECU did not confirm clearing codes." }
             : { success: true, response: "44" };
-        setTimeout(() => window.onObdResult(id, response), 10);
+        if (operation === "readDiagnostics")
+          response = m.diagnosticsFailure
+            ? { ok: false, error: "Adapter disconnected during diagnostics" }
+            : { ok: true, data: m.diagnostics || {} };
+        setTimeout(
+          () => window.onObdResult(id, response),
+          operation === "readDiagnostics" ? m.diagnosticDelay || 10 : 10,
+        );
       },
     };
   }, options);
@@ -287,4 +294,298 @@ test("report preserves previous adapter and scan context after physical disconne
   await expect(
     page.getByRole("textbox", { name: "Diagnostic report text" }),
   ).toHaveValue(/P0420 PERMANENT/);
+});
+
+const expandedTelemetry = () => ({
+  rpm: 832,
+  speed: 0,
+  voltage: 14,
+  coolant: 74,
+  updatedAt: Date.now(),
+  capabilities: { complete: true, supportedCount: 4, errors: [] },
+  parameters: [
+    {
+      id: "01-0C",
+      pid: "0C",
+      name: "Engine speed",
+      value: 832,
+      unit: "rpm",
+      raw: "0D 00",
+      status: "fresh",
+      updatedAt: Date.now(),
+      supported: true,
+      decoded: true,
+    },
+    {
+      id: "01-10",
+      pid: "10",
+      name: "Mass air flow",
+      value: null,
+      unit: "g/s",
+      raw: "",
+      status: "unsupported",
+      updatedAt: null,
+      supported: false,
+      decoded: true,
+    },
+    {
+      id: "01-99",
+      pid: "99",
+      name: "PID 99",
+      value: null,
+      unit: "",
+      raw: "A1 B2 C3",
+      status: "fresh",
+      updatedAt: Date.now(),
+      supported: true,
+      decoded: false,
+    },
+    {
+      id: "01-05",
+      pid: "05",
+      name: "Coolant",
+      value: 74,
+      unit: "°C",
+      raw: "72",
+      status: "stale",
+      updatedAt: Date.now() - 60000,
+      supported: true,
+      decoded: true,
+    },
+    {
+      id: "01-04",
+      pid: "04",
+      name: "Calculated load",
+      value: null,
+      unit: "%",
+      raw: "NO DATA",
+      status: "read_failed",
+      updatedAt: null,
+      supported: true,
+      decoded: true,
+      error: "No valid response",
+    },
+  ],
+});
+
+test("parameter browser includes unknown raw values and distinguishes failure, stale and unsupported", async ({
+  page,
+}) => {
+  const errors = await load(page, { telemetry: expandedTelemetry() });
+  await connect(page);
+  await expect(page.locator("#parameterList")).toContainText("A1 B2 C3");
+  await expect(page.locator(".parameter-row[data-status=stale]")).toContainText(
+    "Coolant",
+  );
+  await expect(
+    page.locator(".parameter-row[data-status=read_failed]"),
+  ).toContainText("Calculated load");
+  await page.locator("#parameterSearch").fill("99");
+  await expect(page.locator(".parameter-row")).toHaveCount(1);
+  await page.locator("#parameterSearch").fill("");
+  await page.locator("#parameterFilter").selectOption("unsupported");
+  await expect(page.locator(".parameter-row")).toHaveCount(1);
+  await expect(page.locator("#parameterList")).toContainText("Mass air flow");
+  expect(errors).toEqual([]);
+});
+
+test("incomplete capability discovery is visible and does not invent support", async ({
+  page,
+}) => {
+  const telemetry = expandedTelemetry();
+  telemetry.capabilities = {
+    complete: false,
+    supportedCount: 4,
+    errors: ["Mode 01 PID 20: NO DATA"],
+  };
+  const errors = await load(page, { telemetry });
+  await connect(page);
+  await expect(page.locator("#capabilitySummary")).toContainText(
+    /incomplete|partial|not complete/i,
+  );
+  expect(errors).toEqual([]);
+});
+
+test("diagnostic operation failure restores retry and displays actionable error", async ({
+  page,
+}) => {
+  const errors = await load(page, { diagnosticsFailure: true });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  await expect(page.locator("#diagnosticsMessage")).toContainText(
+    "Adapter disconnected during diagnostics",
+  );
+  await expect(page.locator("#diagnosticsButton")).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+const snapshotFixture = () => ({
+  complete: true,
+  updatedAt: Date.now(),
+  errors: [],
+  readiness: [
+    {
+      ecu: "7E8",
+      mil: true,
+      dtcCount: 1,
+      ignitionType: "Spark ignition",
+      status: "fresh",
+      raw: "81 07 E5 00",
+      monitors: [
+        { name: "Misfire monitoring", supported: true, complete: true },
+        { name: "Catalyst monitoring", supported: true, complete: false },
+        { name: "Evaporative system", supported: false, complete: null },
+      ],
+    },
+  ],
+  vehicleInfo: [
+    {
+      ecu: "7E8",
+      pid: "02",
+      name: "Vehicle identification number",
+      value: "TEST123",
+      raw: "54 45 53 54",
+      status: "fresh",
+    },
+  ],
+  freezeFrames: [
+    { frame: 0, ecu: "7E8", dtc: null, status: "no_frame", parameters: [] },
+  ],
+});
+
+test("snapshot distinguishes readiness completion, unsupported monitors, vehicle info and absent freeze frame", async ({
+  page,
+}, testInfo) => {
+  const errors = await load(page, { diagnostics: snapshotFixture() });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  await expect(page.locator("#diagnosticsResults")).toContainText("TEST123");
+  await expect(page.locator("#diagnosticsResults")).toContainText("Incomplete");
+  await expect(page.locator("#diagnosticsResults")).toContainText(
+    "Unsupported",
+  );
+  await expect(page.locator("#diagnosticsResults")).toContainText(
+    "No freeze frame stored",
+  );
+  await page.locator("#diagnosticsResults").scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: testInfo.outputPath("diagnostic-snapshot.png"),
+  });
+  expect(errors).toEqual([]);
+});
+
+test("clearing invalidates previously read readiness and freeze-frame snapshot", async ({
+  page,
+}) => {
+  await load(page, { diagnostics: snapshotFixture() });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  await expect(page.locator("#diagnosticsResults")).toContainText("TEST123");
+  await page.locator("#clearButton").click();
+  await page.getByRole("button", { name: "Clear codes", exact: true }).click();
+  await expect(page.locator("#diagnosticsResults")).not.toContainText(
+    "TEST123",
+  );
+});
+
+test("freeze-frame retains stored measurement and exports raw bytes without using current RPM", async ({
+  page,
+}) => {
+  const diagnostics = snapshotFixture();
+  diagnostics.freezeFrames = [
+    {
+      frame: 0,
+      ecu: "7E8",
+      dtc: "P0300",
+      status: "fresh",
+      parameters: [
+        {
+          id: "7E8:0C",
+          ecu: "7E8",
+          pid: "0C",
+          name: "Engine speed",
+          value: 2345,
+          unit: "rpm",
+          raw: "24 A4",
+          status: "fresh",
+          updatedAt: Date.now(),
+          supported: true,
+          decoded: true,
+        },
+      ],
+    },
+  ];
+  await load(page, { diagnostics });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  await expect(page.locator("#diagnosticsResults")).toContainText("P0300");
+  await expect(page.locator("#diagnosticsResults")).toContainText(/2,?345/);
+  await page
+    .locator("#page-faults")
+    .getByRole("button", { name: "Copy report", exact: true })
+    .click();
+  await expect(
+    page.getByRole("textbox", { name: "Diagnostic report text" }),
+  ).toHaveValue(/24 A4/);
+});
+
+test("late diagnostic response cannot restore snapshot after user disconnects", async ({
+  page,
+}) => {
+  await load(page, { diagnostics: snapshotFixture(), diagnosticDelay: 1500 });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  await page.locator("nav [data-go=connect]").click();
+  await page.locator("#disconnectButton").click();
+  await expect(page.locator("#statusPill")).toHaveText("Disconnected");
+  await page.waitForTimeout(1700);
+  await page.locator("nav [data-go=faults]").click();
+  await expect(page.locator("#diagnosticsResults")).not.toContainText(
+    "TEST123",
+  );
+});
+
+test("slow polling respects native per-parameter freshness window", async ({
+  page,
+}) => {
+  const telemetry = expandedTelemetry();
+  telemetry.parameters = [
+    {
+      id: "7E8:5C",
+      ecu: "7E8",
+      pid: "5C",
+      name: "Oil temperature",
+      value: 92,
+      unit: "°C",
+      raw: "84",
+      supported: true,
+      decoded: true,
+      status: "fresh",
+      updatedAt: Date.now() - 20000,
+      staleAfterMs: 60000,
+    },
+  ];
+  await load(page, { telemetry });
+  await connect(page);
+  await expect(page.locator(".parameter-row[data-status=fresh]")).toContainText(
+    "Oil temperature",
+  );
+});
+
+test("snapshot raw disclosures stay open during live refresh", async ({
+  page,
+}) => {
+  await load(page, { diagnostics: snapshotFixture() });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#diagnosticsButton").click();
+  const disclosure = page.locator("#diagnosticsResults details").first();
+  await disclosure.locator("summary").click();
+  await page.waitForTimeout(1200);
+  await expect(disclosure).toHaveAttribute("open", "");
 });
