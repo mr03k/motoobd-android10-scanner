@@ -28,3 +28,9 @@ Use `docs/REVIEW.md` for executed check evidence. Old loop-test claims are super
 `getLiveTelemetryJson()` now returns `parameters` (id, ecu, pid, name, unit, value or null, raw, status, supported, decoded, updatedAt, staleAfterMs, error) and `capabilities` (complete, supportedCount, errors), preserving compatibility dashboard fields.
 
 `requestOperation(id, "readDiagnostics", "")` returns readiness[], freezeFrames[], vehicleInfo[], errors[], rawResponses[], updatedAt and complete. Each record is source-labeled; diagnostics must not be reconstructed from current live readings. Mode01 metadata/capability discovery is reset on reconnect, and queued snapshot work is bound to its session. UI ignores callbacks from replaced sessions.
+
+## 2.5.1 bridge additions
+
+`readMonitorTests` returns tests[], errors[], rawResponses[], updatedAt, complete and protocol information. Raw Mode06 values/limits are not OEM-scaled; legacy CID limit direction and CAN UASID are retained. Exact duplicate grouping occurs only in the UI/report and keeps occurrences. Clear invalidates prior monitor test snapshots.
+
+Live parameter rows now include lastSuccessAt, lastAttemptAt and failureRaw. A retained last-known value after a failed attempt is explicitly not current. DTC scan results include readinessRaw/readiness and protocol/adapter identity as well as mode03/mode07/mode0A raw replies. These are essential for the unresolved Torque fault-list discrepancy on the user's Pride132.

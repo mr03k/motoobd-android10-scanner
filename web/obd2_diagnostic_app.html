@@ -964,6 +964,20 @@
           ></p>
         </div>
 
+        <details
+          id="dtcEvidence"
+          class="panel disclosure"
+          style="margin-top: 20px"
+          hidden
+        >
+          <summary>Raw fault-code responses · last app scan</summary>
+          <p class="small">
+            Mode 03 stored, Mode 07 pending and Mode 0A permanent responses are
+            kept separately. App or adapter snapshots taken at different times
+            can differ.
+          </p>
+          <pre id="dtcRaw" class="diagnostic-raw mono"></pre>
+        </details>
         <section
           class="panel"
           style="margin-top: 20px"
@@ -994,6 +1008,44 @@
             <div class="empty">
               <h3>No snapshot yet</h3>
               <p>Connect an adapter, then read a diagnostic snapshot.</p>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="panel"
+          style="margin-top: 20px"
+          aria-labelledby="monitorTestsTitle"
+        >
+          <div class="section-top">
+            <div>
+              <h2 id="monitorTestsTitle">On-board monitor tests · Mode 06</h2>
+              <p>Read-only test records reported by the ECU</p>
+            </div>
+            <button id="monitorTestsButton" class="primary" disabled>
+              Read monitor tests
+            </button>
+          </div>
+          <p class="small">
+            Test IDs and raw counts need the correct protocol, scaling and
+            vehicle-specific service information. A raw value inside a numeric
+            limit does not establish a pass or diagnose a component. This reader
+            does not infer rich-to-lean behavior or replace manufacturer test
+            procedures.
+          </p>
+          <p
+            id="monitorTestsMessage"
+            class="live-message"
+            role="status"
+            aria-live="polite"
+          ></p>
+          <div id="monitorTestsResults">
+            <div class="empty">
+              <h3>No monitor test read yet</h3>
+              <p>
+                Connect an adapter, then read the ECU's Mode 06 records. Support
+                varies by vehicle.
+              </p>
             </div>
           </div>
         </section>
@@ -1237,6 +1289,11 @@
           diagnosticsPending: false,
           diagnosticsError: "",
           diagnosticsDevice: "",
+          monitorTests: null,
+          monitorTestsPending: false,
+          monitorTestsError: "",
+          monitorTestsDevice: "",
+          scanRaw: null,
         };
         function clear(node) {
           while (node.firstChild) node.removeChild(node.firstChild);
@@ -1244,6 +1301,7 @@
         const pending = new Map();
         let sessionVersion = 0;
         let diagnosticsRenderCache = null;
+        let monitorTestsRenderCache = null;
         let serial = 0,
           interval = null,
           demoTick = 0,
@@ -1278,6 +1336,385 @@
           return result;
         }
 
+        function normalizeMonitorTests(input) {
+          if (!Array.isArray(input)) return [];
+          const exact = new Map();
+          input
+            .filter((item) => item && typeof item === "object")
+            .forEach((item) => {
+              const test = {
+                ecu: String(item.ecu || "unidentified"),
+                protocol: String(item.protocol || "unidentified"),
+                tid:
+                  item.tid === null || item.tid === undefined
+                    ? null
+                    : String(item.tid),
+                cid:
+                  item.cid === null || item.cid === undefined
+                    ? null
+                    : String(item.cid),
+                mid:
+                  item.mid === null || item.mid === undefined
+                    ? null
+                    : String(item.mid),
+                scalingId:
+                  item.scalingId === null || item.scalingId === undefined
+                    ? null
+                    : String(item.scalingId),
+                valueRaw: number(item.valueRaw),
+                minimumRaw: number(item.minimumRaw),
+                maximumRaw: number(item.maximumRaw),
+                raw: String(item.raw || "")
+                  .trim()
+                  .replace(/\s+/g, " "),
+                comparison: String(item.comparison || "unverified"),
+                unit: String(item.unit || "raw counts"),
+                interpretation: String(
+                  item.interpretation ||
+                    "Scaling and vehicle-specific interpretation are unverified.",
+                ),
+              };
+              const key = JSON.stringify(test),
+                count =
+                  number(item.occurrences) !== null && item.occurrences > 0
+                    ? Math.floor(item.occurrences)
+                    : 1;
+              if (exact.has(key)) exact.get(key).occurrences += count;
+              else exact.set(key, Object.assign(test, { occurrences: count }));
+            });
+          const result = Array.from(exact.values()),
+            groups = new Map();
+          result.forEach((test) => {
+            const limitKind =
+                test.minimumRaw === null
+                  ? "max"
+                  : test.maximumRaw === null
+                    ? "min"
+                    : "both",
+              identity = [
+                test.ecu,
+                test.protocol,
+                test.mid,
+                test.tid,
+                test.cid,
+                test.scalingId,
+                limitKind,
+              ].join("|");
+            if (!groups.has(identity)) groups.set(identity, []);
+            groups.get(identity).push(test);
+          });
+          groups.forEach((group) =>
+            group.forEach((test) => (test.conflicting = group.length > 1)),
+          );
+          return result;
+        }
+        function monitorIdentity(test) {
+          return [
+            "ECU " + test.ecu,
+            test.protocol.toUpperCase(),
+            test.mid !== null ? "MID " + test.mid : null,
+            test.tid !== null ? "TID " + test.tid : null,
+            test.cid !== null ? "CID " + test.cid : null,
+            test.scalingId !== null ? "Scaling ID " + test.scalingId : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+        }
+        function rawCount(value) {
+          return number(value) === null
+            ? "Not reported"
+            : String(value) + " raw counts";
+        }
+        function renderMonitorTests() {
+          const key = [
+            state.monitorTests,
+            state.monitorTestsPending,
+            state.connected,
+            state.demo,
+            state.monitorTestsError,
+            state.monitorTestsDevice,
+          ];
+          if (
+            monitorTestsRenderCache &&
+            key.every(
+              (value, index) => value === monitorTestsRenderCache[index],
+            )
+          )
+            return;
+          monitorTestsRenderCache = key;
+          const target = $("monitorTestsResults");
+          clear(target);
+          if (state.monitorTestsPending) {
+            const busy = el("div", "empty");
+            busy.appendChild(el("h3", "", "Reading Mode 06 monitor tests…"));
+            busy.appendChild(
+              el(
+                "p",
+                "",
+                "This read can take up to 90 seconds. Live polling pauses; Disconnect cancels the request.",
+              ),
+            );
+            target.appendChild(busy);
+            return;
+          }
+          const data = state.monitorTests;
+          if (!data) {
+            const empty = el("div", "empty");
+            empty.appendChild(el("h3", "", "No monitor test read yet"));
+            empty.appendChild(
+              el(
+                "p",
+                "",
+                "Connect an adapter, then read the ECU’s Mode 06 records. Support varies by vehicle.",
+              ),
+            );
+            target.appendChild(empty);
+            return;
+          }
+          target.appendChild(
+            el(
+              "p",
+              "stat-line",
+              (state.demo
+                ? "SIMULATED · "
+                : data.complete === true
+                  ? "Mode 06 snapshot · "
+                  : "Partial Mode 06 snapshot · ") +
+                (number(data.updatedAt) !== null
+                  ? new Date(data.updatedAt).toLocaleString()
+                  : "Time unavailable") +
+                " · " +
+                (state.monitorTestsDevice || "Adapter unavailable") +
+                (!state.connected && !state.demo
+                  ? " · previous connection"
+                  : ""),
+            ),
+          );
+          if (state.monitorTestsError)
+            target.appendChild(
+              el(
+                "p",
+                "notice",
+                "Latest read failed; prior records retained: " +
+                  state.monitorTestsError,
+              ),
+            );
+          if (Array.isArray(data.errors) && data.errors.length) {
+            const errors = el("ul", "diagnostic-errors");
+            data.errors.forEach((error) =>
+              errors.appendChild(el("li", "", String(error))),
+            );
+            target.appendChild(errors);
+          }
+          const tests = normalizeMonitorTests(data.tests),
+            total = tests.reduce((sum, test) => sum + test.occurrences, 0);
+          target.appendChild(
+            el(
+              "p",
+              "stat-line",
+              tests.length +
+                " distinct records · " +
+                total +
+                " total occurrences. Identical records are grouped; different records remain separate.",
+            ),
+          );
+          if (!tests.length) {
+            const empty = el("div", "empty");
+            empty.appendChild(el("h3", "", "No decoded monitor-test records"));
+            empty.appendChild(
+              el(
+                "p",
+                "",
+                "Review raw responses and service errors below. Missing records do not establish that a test passed or a component is healthy.",
+              ),
+            );
+            target.appendChild(empty);
+          }
+          tests.forEach((test) => {
+            const row = el("article", "parameter-row monitor-test-row");
+            row.dataset.conflicting = String(test.conflicting);
+            row.appendChild(
+              el("h3", "parameter-name mono", monitorIdentity(test)),
+            );
+            row.appendChild(
+              el(
+                "span",
+                "tag",
+                test.occurrences +
+                  " occurrence" +
+                  (test.occurrences === 1 ? "" : "s"),
+              ),
+            );
+            if (test.conflicting)
+              row.appendChild(
+                el(
+                  "p",
+                  "notice",
+                  "Different results share these identifiers. Records are kept separate; compare the raw responses and vehicle-specific procedures.",
+                ),
+              );
+            diagnosticLine(row, "Reported value", rawCount(test.valueRaw));
+            diagnosticLine(row, "Lower limit", rawCount(test.minimumRaw));
+            diagnosticLine(row, "Upper limit", rawCount(test.maximumRaw));
+            row.appendChild(
+              el(
+                "p",
+                "small",
+                "Interpretation unverified · no pass/fail conclusion.",
+              ),
+            );
+            if (test.interpretation)
+              row.appendChild(el("p", "small", test.interpretation));
+            row.appendChild(
+              el(
+                "p",
+                "diagnostic-raw mono",
+                "Raw record: " + (test.raw || "not returned"),
+              ),
+            );
+            target.appendChild(row);
+          });
+          if (Array.isArray(data.rawResponses) && data.rawResponses.length) {
+            const raw = diagnosticGroup("Mode 06 service transcript");
+            rawDetails(
+              raw,
+              data.rawResponses
+                .map(
+                  (item) =>
+                    String(item.request || "?") +
+                    " → " +
+                    String(item.response || "No response"),
+                )
+                .join("\n\n"),
+            );
+            target.appendChild(raw);
+          }
+        }
+        function demoMonitorTests() {
+          return {
+            complete: true,
+            updatedAt: Date.now(),
+            errors: [],
+            tests: [
+              {
+                ecu: "7E8",
+                protocol: "legacy",
+                tid: "05",
+                cid: "09",
+                mid: null,
+                scalingId: null,
+                valueRaw: 123,
+                minimumRaw: null,
+                maximumRaw: 201,
+                raw: "05 09 00 7B 00 C9",
+                comparison: "unverified",
+                unit: "raw counts",
+                interpretation:
+                  "Simulated example. An OEM conversion and test definition would be required to interpret these counts.",
+              },
+            ],
+            rawResponses: [
+              { request: "0605", response: "46 05 09 00 7B 00 C9" },
+            ],
+          };
+        }
+        async function readMonitorTests() {
+          if (state.busy || (!state.connected && !state.demo)) return;
+          state.busy = true;
+          state.monitorTestsPending = true;
+          state.monitorTestsError = "";
+          const version = sessionVersion,
+            device = state.device,
+            demo = state.demo;
+          render();
+          setMessage(
+            "monitorTestsMessage",
+            "Reading Mode 06 test records without changing ECU data…",
+          );
+          try {
+            let result = demo
+              ? demoMonitorTests()
+              : await request("readMonitorTests");
+            if (typeof result === "string") result = JSON.parse(result);
+            if (version !== sessionVersion)
+              throw new Error(
+                "Monitor-test read cancelled because the adapter session changed.",
+              );
+            if (!result || typeof result !== "object" || result.error)
+              throw new Error(
+                (result && result.error) ||
+                  "No monitor-test response received.",
+              );
+            if (!demo && !state.connected)
+              throw new Error(
+                "The adapter disconnected during the monitor-test read.",
+              );
+            state.monitorTests = result;
+            state.monitorTestsDevice = device;
+            setMessage(
+              "monitorTestsMessage",
+              demo
+                ? "Example monitor tests · simulated raw counts."
+                : result.complete === true
+                  ? "Read complete. Raw counts require verified scaling and vehicle-specific interpretation."
+                  : "Partial monitor-test read. Review service errors and raw responses.",
+              result.complete !== true,
+            );
+          } catch (error) {
+            if (version !== sessionVersion) return;
+            state.monitorTestsError = error.message;
+            setMessage("monitorTestsMessage", error.message, true);
+          } finally {
+            state.busy = false;
+            state.monitorTestsPending = false;
+            render();
+          }
+        }
+
+        function dtcEvidenceText() {
+          if (!state.scanRaw) return "No raw fault-code scan saved.";
+          const scan = state.scanRaw,
+            lines = [
+              "Last app scan: " +
+                (state.scanTime
+                  ? new Date(state.scanTime).toISOString()
+                  : "Time unavailable"),
+              "Adapter: " + (state.scanDevice || "unavailable"),
+              "Protocol: " +
+                String(
+                  scan.protocolDescription || scan.protocol || "not returned",
+                ),
+            ];
+          if (scan.protocolRaw) lines.push("Protocol raw: " + scan.protocolRaw);
+          if (scan.readinessRaw)
+            lines.push(
+              "Same-scan readiness / MIL / DTC count raw (01 01): " +
+                scan.readinessRaw,
+            );
+          if (scan.readiness)
+            lines.push(
+              "Same-scan readiness fields: " + JSON.stringify(scan.readiness),
+            );
+          [
+            ["mode03", "Mode 03 · stored"],
+            ["mode07", "Mode 07 · pending"],
+            ["mode0A", "Mode 0A · permanent"],
+          ].forEach((entry) =>
+            lines.push(
+              "",
+              entry[1],
+              typeof scan[entry[0]] === "string"
+                ? scan[entry[0]]
+                : "Raw response was not returned.",
+            ),
+          );
+          return lines.join("\n");
+        }
+        function renderDtcEvidence() {
+          const evidence = $("dtcEvidence");
+          evidence.hidden = !state.scanRaw;
+          $("dtcRaw").textContent = state.scanRaw ? dtcEvidenceText() : "";
+        }
         function normalizeParameters(input, now) {
           if (!Array.isArray(input)) return [];
           return input
@@ -1313,6 +1750,17 @@
                 raw: String(p.raw || ""),
                 status,
                 updatedAt,
+                lastSuccessAt:
+                  number(p.lastSuccessAt) !== null
+                    ? p.lastSuccessAt
+                    : status === "read_failed"
+                      ? null
+                      : updatedAt,
+                lastAttemptAt:
+                  number(p.lastAttemptAt) !== null
+                    ? p.lastAttemptAt
+                    : updatedAt,
+                failureRaw: String(p.failureRaw || ""),
                 staleAfterMs,
                 supported,
                 decoded: p.decoded === true,
@@ -1403,21 +1851,61 @@
                   : "Not advertised supported"),
             ),
           );
+
           row.appendChild(
             el(
               "p",
               "parameter-meta",
-              (status === "read_failed"
-                ? "Last read attempt: "
-                : "Last successful read: ") +
-                (parameter.updatedAt
-                  ? new Date(parameter.updatedAt).toLocaleString()
+              "Last successful read: " +
+                (parameter.lastSuccessAt
+                  ? new Date(parameter.lastSuccessAt).toLocaleString()
                   : "none"),
             ),
           );
+          if (parameter.lastAttemptAt)
+            row.appendChild(
+              el(
+                "p",
+                "parameter-meta",
+                "Last read attempt: " +
+                  new Date(parameter.lastAttemptAt).toLocaleString(),
+              ),
+            );
+          if (
+            !snapshot &&
+            status !== "fresh" &&
+            parameter.lastSuccessAt &&
+            parameter.value !== null &&
+            parameter.decoded
+          )
+            row.appendChild(
+              el(
+                "p",
+                "small",
+                "Last known · not current: " +
+                  displayParameterValue(
+                    Object.assign({}, parameter, { status: "stale" }),
+                    true,
+                  ),
+              ),
+            );
+          if (parameter.failureRaw)
+            row.appendChild(
+              el(
+                "p",
+                "diagnostic-raw mono",
+                "Latest failed response: " + parameter.failureRaw,
+              ),
+            );
           if (parameter.raw)
             row.appendChild(
-              el("p", "diagnostic-raw mono", "Raw: " + parameter.raw),
+              el(
+                "p",
+                "diagnostic-raw mono",
+                (status === "read_failed" && parameter.lastSuccessAt
+                  ? "Last successful raw: "
+                  : "Raw: ") + parameter.raw,
+              ),
             );
           if (parameter.error)
             row.appendChild(el("p", "parameter-meta", parameter.error));
@@ -2047,7 +2535,11 @@
                   ? 75000
                   : operation === "readDiagnostics"
                     ? 150000
-                    : 30000,
+                    : operation === "readMonitorTests"
+                      ? 120000
+                      : operation === "scanDtc"
+                        ? 75000
+                        : 30000,
               );
             pending.set(id, { resolve, reject, timeout });
             try {
@@ -2154,7 +2646,9 @@
             ? "Simulated session · explore the dashboard"
             : state.paused
               ? "View paused · the adapter session remains connected"
-              : state.diagnosticsPending || state.scanPending
+              : state.diagnosticsPending ||
+                  state.scanPending ||
+                  state.monitorTestsPending
                 ? "Polling paused for a diagnostic read · cached readings expire when stale"
                 : state.connected
                   ? "Live measurements from your connected adapter."
@@ -2203,18 +2697,28 @@
             : "Waiting for fresh data";
           $("scanButton").disabled = !active || state.busy;
           $("diagnosticsButton").disabled = !active || state.busy;
+          $("monitorTestsButton").disabled = !active || state.busy;
+          $("monitorTestsButton").textContent = state.monitorTestsPending
+            ? "Reading monitor tests…"
+            : "Read monitor tests";
           $("diagnosticsButton").textContent = state.diagnosticsPending
             ? "Reading snapshot…"
             : "Read snapshot";
           $("clearButton").disabled =
             !state.connected || state.demo || state.busy;
           $("reportButton").disabled =
-            !active && !state.scanned && !state.diagnostics;
+            !active &&
+            !state.scanned &&
+            !state.diagnostics &&
+            !state.monitorTests;
           $("faultReportButton").disabled =
-            !state.scanned && !state.diagnostics;
+            !state.scanned && !state.diagnostics && !state.monitorTests;
           $("disconnectButton").hidden = !active;
           $("disconnectButton").disabled =
-            state.busy && !state.diagnosticsPending && !state.scanPending;
+            state.busy &&
+            !state.diagnosticsPending &&
+            !state.scanPending &&
+            !state.monitorTestsPending;
           $("disconnectButton").textContent = state.demo
             ? "End demo"
             : "Disconnect";
@@ -2241,6 +2745,7 @@
             state.history.filter((p) => p.rpm !== null).length + " samples";
           renderParameters();
           renderDiagnostics();
+          renderMonitorTests();
           drawChart();
         }
         function drawChart() {
@@ -2322,6 +2827,12 @@
           state.diagnostics = null;
           state.diagnosticsError = "";
           state.diagnosticsDevice = "";
+          state.monitorTests = null;
+          state.monitorTestsError = "";
+          state.monitorTestsDevice = "";
+          state.scanRaw = null;
+          renderDtcEvidence();
+          setMessage("monitorTestsMessage", "");
           setMessage("diagnosticsMessage", "");
           state.history = [];
           state.codes = [];
@@ -2514,7 +3025,12 @@
           }
         }
         async function disconnect() {
-          if (state.busy && !state.diagnosticsPending && !state.scanPending)
+          if (
+            state.busy &&
+            !state.diagnosticsPending &&
+            !state.scanPending &&
+            !state.monitorTestsPending
+          )
             return;
           if (state.demo) {
             stopDemo();
@@ -2594,10 +3110,12 @@
               throw new Error(
                 "Scan cancelled because the adapter session changed.",
               );
+            state.scanRaw = result;
             state.codes = normalizeCodes(result.codes);
             state.scanned = true;
             state.scanTime = Date.now();
             state.scanDevice = state.device;
+            renderDtcEvidence();
             state.scanPartial = result.complete !== true;
             state.scanErrors = Array.isArray(result.errors)
               ? result.errors
@@ -2819,6 +3337,15 @@
                   "The ECU did not confirm the clear request.",
               );
             state.codes = [];
+            state.scanRaw = null;
+            renderDtcEvidence();
+            state.monitorTests = null;
+            state.monitorTestsError = "";
+            state.monitorTestsDevice = "";
+            setMessage(
+              "monitorTestsMessage",
+              "Monitor test snapshot invalidated after clearing codes. Read again to see the ECU’s current records.",
+            );
             state.diagnostics = null;
             state.diagnosticsError = "";
             state.diagnosticsDevice = "";
@@ -2944,12 +3471,25 @@
                 parameter.decoded +
                 " | raw=" +
                 (parameter.raw || "none") +
-                (parameterStatus(parameter) === "read_failed"
-                  ? " | lastReadAttempt="
-                  : " | lastSuccessfulRead=") +
-                (parameter.updatedAt
-                  ? new Date(parameter.updatedAt).toISOString()
+                " | lastSuccessfulRead=" +
+                (parameter.lastSuccessAt
+                  ? new Date(parameter.lastSuccessAt).toISOString()
                   : "none") +
+                " | lastReadAttempt=" +
+                (parameter.lastAttemptAt
+                  ? new Date(parameter.lastAttemptAt).toISOString()
+                  : "none") +
+                " | staleAfterMs=" +
+                parameter.staleAfterMs +
+                " | lastKnownValue=" +
+                (parameter.lastSuccessAt && parameter.value !== null
+                  ? displayParameterValue(
+                      Object.assign({}, parameter, { status: "stale" }),
+                      true,
+                    )
+                  : "none") +
+                " | failureRaw=" +
+                (parameter.failureRaw || "none") +
                 (parameter.error ? " | error=" + parameter.error : ""),
             ),
           );
@@ -3096,6 +3636,70 @@
             });
           }
 
+          lines.push("", "Fault-code raw evidence", dtcEvidenceText());
+          lines.push("", "On-board monitor tests · Mode 06");
+          const monitor = state.monitorTests;
+          if (!monitor)
+            lines.push("Not read or invalidated after clearing codes.");
+          else {
+            lines.push(
+              (state.demo ? "SIMULATED · " : "") +
+                "Read: " +
+                (number(monitor.updatedAt) !== null
+                  ? new Date(monitor.updatedAt).toISOString()
+                  : "unknown") +
+                " | adapter=" +
+                state.monitorTestsDevice +
+                " | " +
+                (monitor.complete === true ? "complete" : "partial"),
+            );
+            lines.push(
+              "Raw counts; scaling and OEM interpretation unverified. No inferred pass/fail or component diagnosis.",
+            );
+            if (state.monitorTestsError)
+              lines.push(
+                "Latest read failed; prior records retained: " +
+                  state.monitorTestsError,
+              );
+            (Array.isArray(monitor.errors) ? monitor.errors : []).forEach(
+              (error) => lines.push("Unavailable: " + error),
+            );
+            normalizeMonitorTests(monitor.tests).forEach((test) =>
+              lines.push(
+                monitorIdentity(test) +
+                  " | valueRaw=" +
+                  test.valueRaw +
+                  " | minimumRaw=" +
+                  test.minimumRaw +
+                  " | maximumRaw=" +
+                  test.maximumRaw +
+                  " | unit=" +
+                  test.unit +
+                  " | comparison=" +
+                  test.comparison +
+                  " | occurrences=" +
+                  test.occurrences +
+                  " | differingRecords=" +
+                  test.conflicting +
+                  " | raw=" +
+                  test.raw +
+                  " | interpretation=" +
+                  test.interpretation,
+              ),
+            );
+            (Array.isArray(monitor.rawResponses)
+              ? monitor.rawResponses
+              : []
+            ).forEach((item) =>
+              lines.push(
+                "Mode06 request " +
+                  item.request +
+                  " raw response: " +
+                  item.response,
+              ),
+            );
+          }
+
           const textarea = el("textarea", "control");
           textarea.readOnly = true;
           textarea.value = lines.join("\n");
@@ -3151,6 +3755,12 @@
                   setMessage(
                     "diagnosticsMessage",
                     "Diagnostic read cancelled: the adapter disconnected.",
+                    true,
+                  );
+                if (state.monitorTestsPending)
+                  setMessage(
+                    "monitorTestsMessage",
+                    "Monitor-test read cancelled: the adapter disconnected.",
                     true,
                   );
                 if (state.scanPending)
@@ -3211,6 +3821,7 @@
         $("disconnectButton").addEventListener("click", disconnect);
         $("scanButton").addEventListener("click", scan);
         $("diagnosticsButton").addEventListener("click", readDiagnostics);
+        $("monitorTestsButton").addEventListener("click", readMonitorTests);
         $("parameterSearch").addEventListener("input", renderParameters);
         $("parameterFilter").addEventListener("change", renderParameters);
         $("clearButton").addEventListener("click", reviewClear);
@@ -3271,6 +3882,7 @@
         window.MotoObd = {
           normalizeTelemetry,
           normalizeParameters,
+          normalizeMonitorTests,
           parameterStatus,
           displayParameterValue,
           normalizeCodes,

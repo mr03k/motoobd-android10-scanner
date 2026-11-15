@@ -54,3 +54,11 @@ Use **All parameters** to search by PID, name or raw response and filter fresh, 
 The **Diagnostic snapshot** reads supported readiness/MIL information, frame 00 freeze-frame data, and Mode 09 vehicle information. A zero freeze-frame trigger code is shown as no stored snapshot. Unsupported Mode 0A is explained in words rather than mistaken for a trouble code. Vehicle identifiers may appear in copied reports; review reports before sharing.
 
 Coverage is limited to standard OBD-II services advertised by the responding ECU(s). Proprietary manufacturer parameters, ABS/airbag modules, actuator tests, coding, service resets and additional manufacturer-specific freeze-frame records require separate validated definitions and are not probed. Unknown supported fields remain raw, not invented measurements.
+
+## Legacy compatibility and monitor tests (2.5.1)
+
+Legacy Mode09 support responses include a message counter before the bitmap. MotoOBD now handles this and reassembles validated, ordered legacy VIN/calibration/CVN sequences. Ambiguous or incomplete sequences remain raw rather than being combined across unknown ECUs.
+
+**Read monitor tests** retrieves supported Mode06 results without running actuators or clearing data. Legacy TID/CID records and CAN MID/TID/UASID records have different layouts. Values and limits are shown as raw counts; OEM scaling, signed interpretation and component meanings are unverified. A raw limit comparison is not a confirmed vehicle/component diagnosis. Exact repeated records show occurrence counts; differing records are retained.
+
+Read-only completed NO DATA responses get one retry. Prompt timeouts still end the connection. All-parameter reports distinguish the last successful measurement from the latest failed attempt. Fault reports include protocol, adapter identity, readiness count and exact stored/pending/permanent replies for comparison with other scanners.

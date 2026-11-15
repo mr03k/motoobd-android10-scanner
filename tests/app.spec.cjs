@@ -79,6 +79,10 @@ async function load(page, options = {}) {
           response = m.diagnosticsFailure
             ? { ok: false, error: "Adapter disconnected during diagnostics" }
             : { ok: true, data: m.diagnostics || {} };
+        if (operation === "readMonitorTests")
+          response = m.monitorFailure
+            ? { ok: false, error: "Monitor test read interrupted" }
+            : { ok: true, data: m.monitorTests || {} };
         setTimeout(
           () => window.onObdResult(id, response),
           operation === "readDiagnostics" ? m.diagnosticDelay || 10 : 10,
@@ -588,4 +592,188 @@ test("snapshot raw disclosures stay open during live refresh", async ({
   await disclosure.locator("summary").click();
   await page.waitForTimeout(1200);
   await expect(disclosure).toHaveAttribute("open", "");
+});
+
+const torqueMonitorFixture = () => ({
+  complete: true,
+  updatedAt: Date.now(),
+  errors: [],
+  tests: [
+    {
+      ecu: "unidentified",
+      protocol: "legacy",
+      tid: "05",
+      cid: "09",
+      mid: null,
+      scalingId: null,
+      valueRaw: 32768,
+      minimumRaw: null,
+      maximumRaw: 20768,
+      raw: "05 09 80 00 51 20",
+      comparison: "unverified",
+      unit: "raw counts",
+      interpretation: "OEM conversion unverified.",
+    },
+    {
+      ecu: "unidentified",
+      protocol: "legacy",
+      tid: "05",
+      cid: "09",
+      mid: null,
+      scalingId: null,
+      valueRaw: 32768,
+      minimumRaw: null,
+      maximumRaw: 20768,
+      raw: "05 09 80 00 51 20",
+      comparison: "unverified",
+      unit: "raw counts",
+      interpretation: "OEM conversion unverified.",
+    },
+    {
+      ecu: "unidentified",
+      protocol: "legacy",
+      tid: "05",
+      cid: "0A",
+      mid: null,
+      scalingId: null,
+      valueRaw: 32768,
+      minimumRaw: 31168,
+      maximumRaw: null,
+      raw: "05 8A 80 00 79 C0",
+      comparison: "unverified",
+      unit: "raw counts",
+      interpretation: "OEM conversion unverified.",
+    },
+  ],
+  rawResponses: [
+    { request: "0605", response: "46 05 09 80 00 51 20\r46 05 8A 80 00 79 C0" },
+  ],
+});
+
+test("Mode06 retains Torque-style raw values and duplicate occurrences without claiming an OEM diagnosis", async ({
+  page,
+}) => {
+  const errors = await load(page, { monitorTests: torqueMonitorFixture() });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#monitorTestsButton").click();
+  await expect(page.locator(".monitor-test-row")).toHaveCount(2);
+  await expect(page.locator("#monitorTestsResults")).toContainText(/32,?768/);
+  await expect(page.locator("#monitorTestsResults")).toContainText(/20,?768/);
+  await expect(page.locator("#monitorTestsResults")).toContainText(
+    /unverified/i,
+  );
+  await expect(page.locator("#monitorTestsResults")).not.toContainText(
+    "Rich to Lean",
+  );
+  await page
+    .locator("#page-faults")
+    .getByRole("button", { name: "Copy report", exact: true })
+    .click();
+  await expect(
+    page.getByRole("textbox", { name: "Diagnostic report text" }),
+  ).toHaveValue(/0605/);
+  expect(errors).toEqual([]);
+});
+
+test("Mode06 conflicting same-ID same-limit records remain visible", async ({
+  page,
+}) => {
+  const monitorTests = torqueMonitorFixture();
+  monitorTests.tests[1] = {
+    ...monitorTests.tests[1],
+    valueRaw: 123,
+    raw: "05 09 00 7B 51 20",
+  };
+  await load(page, { monitorTests });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#monitorTestsButton").click();
+  await expect(page.locator(".monitor-test-row")).toHaveCount(3);
+  await expect(
+    page.locator(".monitor-test-row[data-conflicting=true]"),
+  ).toHaveCount(2);
+});
+
+test("Mode06 failure is actionable and leaves retry enabled", async ({
+  page,
+}) => {
+  await load(page, { monitorFailure: true });
+  await connect(page);
+  await page.locator("nav [data-go=faults]").click();
+  await page.locator("#monitorTestsButton").click();
+  await expect(page.locator("#monitorTestsMessage")).toContainText(
+    "Monitor test read interrupted",
+  );
+  await expect(page.locator("#monitorTestsButton")).toBeEnabled();
+});
+
+test("DTC raw evidence retains empty stored, pending errors and unsupported permanent replies", async ({
+  page,
+}) => {
+  await load(page, {
+    scan: {
+      complete: false,
+      codes: [],
+      errors: ["Mode 0A unsupported"],
+      mode03: "43 00 00 00 00 00 00",
+      mode07: "NO DATA",
+      mode0A: "7F 0A 11",
+      protocol: "ISO 9141-2",
+      readiness: { raw: "41 01 00 37 65 65" },
+    },
+  });
+  await connect(page);
+  await faults(page);
+  await expect(page.locator("#dtcEvidence")).toContainText(
+    "43 00 00 00 00 00 00",
+  );
+  await expect(page.locator("#dtcEvidence")).toContainText("7F 0A 11");
+  await page
+    .locator("#page-faults")
+    .getByRole("button", { name: "Copy report", exact: true })
+    .click();
+  await expect(
+    page.getByRole("textbox", { name: "Diagnostic report text" }),
+  ).toHaveValue(/43 00 00 00 00 00 00/);
+});
+
+test("failed latest PID read preserves last-known value with separate failure evidence and times", async ({
+  page,
+}) => {
+  const telemetry = expandedTelemetry();
+  const success = Date.now() - 25000,
+    attempt = Date.now();
+  telemetry.parameters = [
+    {
+      id: "unidentified:0F",
+      ecu: "unidentified",
+      pid: "0F",
+      name: "Intake air temperature",
+      value: 30,
+      unit: "°C",
+      raw: "46",
+      status: "read_failed",
+      supported: true,
+      decoded: true,
+      updatedAt: success,
+      lastSuccessAt: success,
+      lastAttemptAt: attempt,
+      failureRaw: "NO DATA",
+      error: "NO DATA",
+    },
+  ];
+  await load(page, { telemetry });
+  await connect(page);
+  await expect(page.locator("#parameterList")).toContainText(
+    /Last known|last known/,
+  );
+  await expect(page.locator("#parameterList")).toContainText("NO DATA");
+  await page.locator("#reportButton").click();
+  await expect(
+    page.getByRole("textbox", { name: "Diagnostic report text" }),
+  ).toHaveValue(/lastSuccessfulRead=/);
+  await expect(
+    page.getByRole("textbox", { name: "Diagnostic report text" }),
+  ).toHaveValue(/failureRaw=NO DATA/);
 });

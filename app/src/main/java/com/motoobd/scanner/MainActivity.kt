@@ -50,10 +50,13 @@ class MainActivity : Activity() {
     private var tick = 0
     private data class Reading(val value: Double, val at: Long = System.currentTimeMillis())
     private val readings = ConcurrentHashMap<String, Reading>()
-    private data class Parameter(val pid: Int, val ecu: String, val bytes: List<Int>, val at: Long, val error: String = "")
-    private val parameters = ConcurrentHashMap<String, Parameter>()
+    private val parameters = ConcurrentHashMap<String, ParameterReading>()
     @Volatile private var capabilities = CapabilityDiscovery.Result(emptyMap(), emptyMap(), emptyList())
     @Volatile private var identifiedCan = false
+    @Volatile private var protocolRaw = ""
+    @Volatile private var adapterIdentity = ""
+    private var lastReadAttempts = emptyList<String>()
+    private var monitorCursor = 0
     private var pollPids = emptyList<Int>()
     private var slowCursor = 0
     private var freezeCursor = 0
@@ -158,6 +161,9 @@ class MainActivity : Activity() {
         parameters.clear()
         capabilities = CapabilityDiscovery.Result(emptyMap(), emptyMap(), emptyList())
         identifiedCan = false
+        protocolRaw = ""
+        adapterIdentity = ""
+        monitorCursor = 0
         pollPids = emptyList()
         freezeCursor = 0
         infoCursor = 0
@@ -178,6 +184,18 @@ class MainActivity : Activity() {
             failConnection(e.message ?: "Adapter communication failed.", token)
             throw e
         }
+    }
+
+    private fun readOnlyCommand(request: String, timeout: Long = 1800): String {
+        val token = generation.get()
+        var attempts = 0
+        val result = ReadOnlyRetry.execute(request) {
+            ensureSession(token)
+            if (attempts++ > 0) Thread.sleep(100)
+            command(request, timeout)
+        }
+        lastReadAttempts = result.attempts
+        return result.raw
     }
 
     @SuppressLint("MissingPermission")
@@ -243,7 +261,7 @@ class MainActivity : Activity() {
     }
 
     private fun initializeElm() {
-        command("ATZ", 2500)
+        adapterIdentity = command("ATZ", 2500)
         for (cmd in listOf("ATE0", "ATL0", "ATS1", "ATH0", "ATSP0")) {
             if (!Regex("(?m)^\\s*OK\\s*$").containsMatchIn(command(cmd).replace('\r', '\n'))) {
                 throw IOException("Adapter rejected $cmd. Use a compatible ELM327 adapter.")
@@ -253,6 +271,7 @@ class MainActivity : Activity() {
             throw IOException("Adapter responded, but no ECU replied. Check ignition, cable, and vehicle OBD-II compatibility.")
         }
         val protocolReply = command("ATDPN").trim().uppercase()
+        protocolRaw = protocolReply
         val protocol = Regex("^(?:A)?([1-9])$").find(protocolReply)?.groupValues?.get(1)?.toIntOrNull()
             ?: throw IOException("Could not identify the ECU protocol. Reconnect with a compatible ELM327 adapter.")
         countedDtcs = protocol in 6..9
@@ -392,17 +411,18 @@ class MainActivity : Activity() {
     }
     private fun discoverCapabilities(mode: Int, deadline: Long = Long.MAX_VALUE): CapabilityDiscovery.Result {
         val token = generation.get()
-        return CapabilityDiscovery.discover(mode) { request ->
+        return CapabilityDiscovery.discover(mode, legacy = !countedDtcs) { request ->
             ensureSession(token)
             if (SystemClock.elapsedRealtime() >= deadline) throw DiagnosticBudgetException()
-            command(request, 1800)
+            readOnlyCommand(request, 1800)
         }
     }
     private class DiagnosticBudgetException : IOException("Diagnostic read reached its time limit. Partial results are shown; retry to refresh.")
     private fun record(key: String, value: Double) { readings[key] = Reading(value) }
     private val legacyKeys = mapOf(0x0C to "rpm", 0x0D to "speed", 0x05 to "coolant", 0x0F to "intake", 0x0B to "map", 0x33 to "baro", 0x11 to "throttle", 0x04 to "load", 0x10 to "maf", 0x06 to "stft")
     private fun readParameter(pid: Int) {
-        val raw = command("01%02X".format(pid), 1800)
+        val raw = readOnlyCommand("01%02X".format(pid), 1800)
+        val previous = parameters.filterValues { it.pid == pid }
         parameters.entries.removeIf { it.value.pid == pid }
         val replies = ObdParser.frames(raw).filter { it.bytes.size > 2 && it.bytes[0] == 0x41 && it.bytes[1] == pid }
         val now = System.currentTimeMillis()
@@ -411,7 +431,10 @@ class MainActivity : Activity() {
             if (pid !in supported) continue
             val frames = bySource[ecu].orEmpty()
             if (frames.isEmpty()) {
-                parameters["$ecu:%02X".format(pid)] = Parameter(pid, ecu, emptyList(), now, raw.take(160).ifEmpty { "No parameter data returned." })
+                val error = raw.take(160).ifEmpty { "No parameter data returned." }
+                val old = previous.filterValues { it.ecu == ecu || it.ecu.startsWith("$ecu response ") }
+                if (old.isNotEmpty()) old.forEach { (id, sample) -> parameters[id] = ReadingHistory.failed(sample, pid, ecu, raw, now, error) }
+                else parameters["$ecu:%02X".format(pid)] = ReadingHistory.failed(null, pid, ecu, raw, now, error)
             }
         }
         bySource.forEach { (ecu, frames) -> frames.forEachIndexed { index, frame ->
@@ -419,7 +442,9 @@ class MainActivity : Activity() {
             val definition = PidCatalogue.definition(pid)
             val error = if (bytes.size < definition.size) "Truncated PID reply." else ""
             val source = if (frames.size > 1) "$ecu response ${index + 1}" else ecu
-            parameters["$source:%02X".format(pid)] = Parameter(pid, source, bytes, now, error)
+            val id = "$source:%02X".format(pid)
+            parameters[id] = if (error.isNotEmpty()) ReadingHistory.failed(previous[id], pid, source, raw, now, error)
+                else ParameterReading(pid, source, bytes, now)
         } }
         // Compatibility dashboard only uses an unambiguous single response or stable primary CAN ECU.
         val primary = capabilities.supported.keys.filter { it != "unidentified" }.sorted().firstOrNull()
@@ -445,13 +470,14 @@ class MainActivity : Activity() {
             record("voltMin", minOf(readings["voltMin"]?.value ?: it, it))
         }
     }
-    private fun parameterJson(pid: Int, ecu: String, bytes: List<Int>, at: Long, status: String, error: String = "", supported: Boolean = true): JSONObject {
+    private fun parameterJson(pid: Int, ecu: String, bytes: List<Int>, at: Long, status: String, error: String = "", supported: Boolean = true, lastSuccessAt: Long = if (status in listOf("fresh", "stale")) at else 0, lastAttemptAt: Long = at, failureRaw: String = ""): JSONObject {
         val definition = PidCatalogue.definition(pid)
-        val value = if (status in listOf("fresh", "stale")) PidCatalogue.decode(pid, bytes) else null
+        val value = if (lastSuccessAt > 0) PidCatalogue.decode(pid, bytes) else null
         return JSONObject().put("id", "$ecu:%02X".format(pid)).put("ecu", ecu).put("pid", "%02X".format(pid))
             .put("name", definition.name).put("unit", definition.unit).put("value", value ?: JSONObject.NULL)
             .put("raw", PidCatalogue.rawHex(bytes)).put("status", status).put("updatedAt", at)
             .put("supported", supported).put("decoded", value != null).put("error", error)
+            .put("lastSuccessAt", lastSuccessAt).put("lastAttemptAt", lastAttemptAt).put("failureRaw", failureRaw)
             .put("staleAfterMs", maxOf(10000L, pollPids.size * 7000L))
     }
     private fun parameterSnapshot(): JSONArray {
@@ -466,7 +492,7 @@ class MainActivity : Activity() {
                 if (samples.isEmpty()) rows.put(parameterJson(pid, ecu, emptyList(), 0,
                     if (pid in supported) "read_failed" else "unsupported", if (pid in supported) "Waiting for first read." else "Not advertised by ECU.", pid in supported))
                 else samples.forEach { sample -> rows.put(parameterJson(pid, sample.ecu, sample.bytes, sample.at,
-                    if (sample.error.isNotEmpty()) "read_failed" else if (state != "connected" || now - sample.at > staleAfter) "stale" else "fresh", sample.error)) }
+                    if (sample.error.isNotEmpty()) "read_failed" else if (state != "connected" || now - sample.at > staleAfter) "stale" else "fresh", sample.error, true, sample.at, sample.attemptedAt, sample.failureRaw)) }
             }
         }
         return rows
@@ -487,8 +513,8 @@ class MainActivity : Activity() {
         fun query(request: String): String {
             ensureSession(token)
             if (SystemClock.elapsedRealtime() >= deadline) throw DiagnosticBudgetException()
-            val raw = command(request, 2500)
-            rawResponses.put(JSONObject().put("request", request).put("response", raw))
+            val raw = readOnlyCommand(request, 2500)
+            lastReadAttempts.forEachIndexed { index, response -> rawResponses.put(JSONObject().put("request", request).put("attempt", index + 1).put("response", response)) }
             val mode = request.take(2).toInt(16)
             if (ObdParser.hasNegativeReply(raw, mode)) errors.put("Mode %02X request %s included a negative ECU reply: %s".format(mode, request, raw.take(160)))
             return raw
@@ -531,7 +557,7 @@ class MainActivity : Activity() {
                 freezeRows.values.forEach { row -> if (row.optString("status") != "no_frame") row.put("status", "read_failed").put("error", error) }
             }
             if (freezeRows.values.any { it.optString("status") == "fresh" }) {
-                val support = CapabilityDiscovery.discover(2, ::query)
+                val support = CapabilityDiscovery.discover(2, legacy = !countedDtcs, query = ::query)
                 support.errors.forEach { errors.put(it) }
                 (support.supported.keys - freezeRows.keys).forEach { errors.put("Mode 02 source $it did not provide an unambiguous trigger code. Its parameter replies cannot be attached to a snapshot; raw replies retained.") }
                 val allPids = CapabilityDiscovery.pollOrder(support.supported).filter { it != 2 }
@@ -565,11 +591,12 @@ class MainActivity : Activity() {
                 }
             }
             var infoSupportRaw = ""
-            val infoSupport = CapabilityDiscovery.discover(9) { request -> query(request).also { if (request == "0900") infoSupportRaw = it } }
+            val infoSupport = CapabilityDiscovery.discover(9, legacy = !countedDtcs) { request -> query(request).also { if (request == "0900") infoSupportRaw = it } }
             infoSupport.errors.forEach { errors.put(it) }
             if (infoSupport.supported.isEmpty()) vehicleInfo.put(JSONObject().put("ecu", "unidentified").put("pid", "00").put("name", "Vehicle information support")
                 .put("value", JSONObject.NULL).put("raw", infoSupportRaw).put("status", unavailableStatus(infoSupportRaw, 9)).put("error", "Mode 09 supported information unavailable; see raw responses."))
             val allInfoPids = CapabilityDiscovery.pollOrder(infoSupport.supported)
+            val legacyCounts = mutableMapOf<Pair<String, Int>, Int?>()
             val infoRotation = if (allInfoPids.isEmpty()) emptyList() else allInfoPids.drop(infoCursor % allInfoPids.size) + allInfoPids.take(infoCursor % allInfoPids.size)
             for (pid in infoRotation) {
                 val raw = query("09%02X".format(pid))
@@ -582,6 +609,21 @@ class MainActivity : Activity() {
                         val error = issue("Mode 09 PID %02X from %s".format(pid, ecu), raw)
                         vehicleInfo.put(JSONObject().put("ecu", ecu).put("pid", "%02X".format(pid)).put("name", DiagnosticDecoder.vehicleInfoName(pid))
                             .put("value", JSONObject.NULL).put("raw", raw).put("status", "read_failed").put("error", error))
+                    }
+                    if (!countedDtcs && pid in listOf(1, 3, 5)) legacyCounts[ecu to pid] = DiagnosticDecoder.legacyMessageCount(matches.map { it.bytes.drop(2) })
+                    if (!countedDtcs && pid in listOf(2, 4, 6) && matches.isNotEmpty()) {
+                        val countKey = ecu to pid - 1
+                        if (!legacyCounts.containsKey(countKey) && pid - 1 in advertised) {
+                            val countRaw = query("09%02X".format(pid - 1))
+                            val countFrames = ObdParser.frames(countRaw).filter { it.ecu == ecu && it.bytes.take(2) == listOf(0x49, pid - 1) }
+                            legacyCounts[countKey] = DiagnosticDecoder.legacyMessageCount(countFrames.map { it.bytes.drop(2) })
+                        }
+                        val decoded = DiagnosticDecoder.legacyVehicleInfo(pid, matches.map { it.bytes.drop(2) }, legacyCounts[countKey])
+                        vehicleInfo.put(JSONObject().put("ecu", ecu).put("pid", "%02X".format(pid)).put("name", DiagnosticDecoder.vehicleInfoName(pid))
+                            .put("value", decoded.value ?: JSONObject.NULL).put("raw", matches.joinToString(" | ") { PidCatalogue.rawHex(it.bytes.drop(2)) })
+                            .put("status", "fresh").put("error", decoded.error).put("sourceVerified", ecu != "unidentified"))
+                        if (decoded.error.isNotEmpty()) errors.put("Mode 09 PID %02X: %s".format(pid, decoded.error))
+                        continue
                     }
                     matches.forEachIndexed { index, frame ->
                         val bytes = frame.bytes.drop(2)
@@ -598,15 +640,80 @@ class MainActivity : Activity() {
         ensureSession(token)
         return JSONObject().put("readiness", readiness).put("freezeFrames", freezeFrames).put("vehicleInfo", vehicleInfo)
             .put("errors", errors).put("complete", errors.length() == 0).put("updatedAt", System.currentTimeMillis()).put("rawResponses", rawResponses)
+            .put("protocol", protocolDescription()).put("protocolRaw", protocolRaw).put("adapterIdentity", adapterIdentity)
     }
+    private fun protocolDescription(): String {
+        val id = protocolRaw.removePrefix("A").toIntOrNull()
+        return when (id) { 1 -> "SAE J1850 PWM"; 2 -> "SAE J1850 VPW"; 3 -> "ISO 9141-2"; 4 -> "ISO 14230-4 KWP (5 baud)"; 5 -> "ISO 14230-4 KWP (fast init)"; 6 -> "ISO 15765-4 CAN (11 bit, 500 kbaud)"; 7 -> "ISO 15765-4 CAN (29 bit, 500 kbaud)"; 8 -> "ISO 15765-4 CAN (11 bit, 250 kbaud)"; 9 -> "ISO 15765-4 CAN (29 bit, 250 kbaud)"; else -> "Unknown protocol" }
+    }
+    private fun readMonitorTests(): JSONObject {
+        if (state != "connected") throw IOException("Connect to an ECU before reading monitor results.")
+        val token = generation.get()
+        val deadline = SystemClock.elapsedRealtime() + 90000
+        val rawResponses = JSONArray()
+        val errors = JSONArray()
+        val tests = JSONArray()
+        fun query(request: String): String {
+            ensureSession(token)
+            if (SystemClock.elapsedRealtime() >= deadline) throw DiagnosticBudgetException()
+            val raw = readOnlyCommand(request, 2500)
+            lastReadAttempts.forEachIndexed { index, response -> rawResponses.put(JSONObject().put("request", request).put("attempt", index + 1).put("response", response)) }
+            return raw
+        }
+        try {
+            val support = CapabilityDiscovery.discover(6, legacy = !countedDtcs, query = ::query)
+            support.errors.forEach { errors.put(it) }
+            var ids = CapabilityDiscovery.pollOrder(support.supported)
+            if (ids.isEmpty() && !countedDtcs) {
+                // Legacy availability TID00 can be absent; probe only the two user-observed IDs.
+                ids = listOf(0x05, 0x0D)
+                errors.put("No usable legacy availability bitmap. Only targeted TIDs 05 and 0D are read; this is not a complete monitor inventory.")
+            }
+            val rotation = if (ids.isEmpty()) emptyList() else ids.drop(monitorCursor % ids.size) + ids.take(monitorCursor % ids.size)
+            for (id in rotation) {
+                val raw = query("06%02X".format(id))
+                if (ids.isNotEmpty()) monitorCursor = (ids.indexOf(id) + 1) % ids.size
+                val decoded = MonitorTestDecoder.parse(raw, id, countedDtcs)
+                decoded.errors.forEach { errors.put(it) }
+                decoded.tests.forEach { test ->
+                    tests.put(JSONObject().put("ecu", test.ecu).put("protocol", if (countedDtcs) "can" else "legacy")
+                        .put("tid", "%02X".format(test.tid)).put("cid", test.cid?.let { "%02X".format(it) } ?: JSONObject.NULL)
+                        .put("mid", test.mid?.let { "%02X".format(it) } ?: JSONObject.NULL)
+                        .put("scalingId", test.scalingId?.let { "%02X".format(it) } ?: JSONObject.NULL)
+                        .put("valueRaw", test.value).put("minimumRaw", test.minimum ?: JSONObject.NULL).put("maximumRaw", test.maximum ?: JSONObject.NULL)
+                        .put("raw", PidCatalogue.rawHex(listOf(0x46) + test.raw)).put("limitType", test.limitType)
+                        .put("comparison", "unverified").put("unit", "raw counts").put("scalingVerified", false).put("status", "raw")
+                        .put("interpretation", "Identifier layout only. Physical units, OEM component meaning and diagnostic interpretation are unverified."))
+                }
+            }
+        } catch (e: DiagnosticBudgetException) {
+            errors.put("Monitor read reached its time limit. Refresh continues with the next advertised IDs; partial results are shown.")
+        }
+        ensureSession(token)
+        return JSONObject().put("tests", tests).put("errors", errors).put("rawResponses", rawResponses).put("complete", errors.length() == 0)
+            .put("updatedAt", System.currentTimeMillis()).put("protocol", if (countedDtcs) "can" else "legacy")
+            .put("protocolDescription", protocolDescription()).put("protocolRaw", protocolRaw).put("adapterIdentity", adapterIdentity)
+    }
+
     private fun scanDtcs(): JSONObject {
         if (state != "connected") throw IOException("Connect to an ECU before scanning.")
         val codes = JSONArray()
         val result = JSONObject()
         val errors = JSONArray()
+        result.put("protocol", protocolDescription()).put("protocolRaw", protocolRaw).put("adapterIdentity", adapterIdentity)
+        val readinessRaw = readOnlyCommand("0101", 2500)
+        result.put("readinessRaw", readinessRaw)
+        val readinessRows = JSONArray()
+        ObdParser.frames(readinessRaw).filter { it.bytes.take(2) == listOf(0x41, 1) }.forEach { frame -> DiagnosticDecoder.readiness(frame.bytes.drop(2))?.let {
+            readinessRows.put(JSONObject().put("ecu", frame.ecu).put("mil", it.mil).put("dtcCount", it.dtcCount).put("raw", PidCatalogue.rawHex(frame.bytes.drop(2))))
+        } }
+        result.put("readiness", readinessRows)
         for ((request, reply, mode) in listOf(Triple("03", 0x43, "STORED"), Triple("07", 0x47, "PENDING"), Triple("0A", 0x4A, "PERMANENT"))) {
-            val raw = command(request, 4000)
+            val raw = readOnlyCommand(request, 4000)
             result.put("mode$request", raw)
+            val attempts = JSONArray()
+            lastReadAttempts.forEach { attempts.put(it) }
+            result.put("mode${request}Attempts", attempts)
             if (!ObdParser.validDtcReply(raw, reply, countedDtcs)) {
                 val unsupported = ObdParser.frames(raw).any { it.bytes.size >= 3 && it.bytes[0] == 0x7F && it.bytes[1] == request.toInt(16) && it.bytes[2] in listOf(0x11, 0x12) }
                 val reason = if (unsupported) "${if (request == "0A") "Permanent codes" else "$mode codes"}: unsupported by ECU" else "Read failed or incomplete"
@@ -620,7 +727,8 @@ class MainActivity : Activity() {
 
     inner class ObdBridge {
         @JavascriptInterface fun getConnectionStateJson(): String = JSONObject()
-            .put("connected", state == "connected").put("state", state).put("device", deviceLabel).put("error", lastError).toString()
+            .put("connected", state == "connected").put("state", state).put("device", deviceLabel).put("error", lastError)
+            .put("protocol", protocolDescription()).put("protocolRaw", protocolRaw).put("adapterIdentity", adapterIdentity).toString()
         @JavascriptInterface fun getLiveTelemetryJson(): String {
             val now = System.currentTimeMillis()
             val result = JSONObject().put("connected", state == "connected").put("state", state)
@@ -656,13 +764,14 @@ class MainActivity : Activity() {
             worker.execute {
                 val result = JSONObject()
                 try {
-                    if (operation in listOf("scanDtc", "clearDtc", "readDiagnostics") && generation.get() != requestGeneration) throw IOException("Operation cancelled because the connection changed.")
+                    if (operation in listOf("scanDtc", "clearDtc", "readDiagnostics", "readMonitorTests") && generation.get() != requestGeneration) throw IOException("Operation cancelled because the connection changed.")
                     val data: Any = when (operation) {
                         "listDevices" -> JSONArray(listPairedDevices())
                         "connect" -> connect(argument.trim().uppercase(), requestGeneration)
                         "disconnect" -> "DISCONNECTED"
                         "scanDtc" -> scanDtcs()
                         "readDiagnostics" -> readDiagnostics()
+                        "readMonitorTests" -> readMonitorTests()
                         "clearDtc" -> {
                             if (state != "connected") throw IOException("Connect to an ECU before clearing codes.")
                             val response = command("04", 6000)
