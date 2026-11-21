@@ -1,5 +1,5 @@
 @echo off
-title MotoOBD v2.4.0 - Protocol-Aware DTC Scanner + UDS 19 02 Fallback
+title MotoOBD v2.4.0 - Protocol-Aware DTC Scanner + Proxy-Aware Git Push
 color 0B
 echo ============================================================================
 echo  Deploying MotoOBD v2.4.0: ATDPN CAN/ISO Parity + ATAL + UDS 19 02 Scan
@@ -3475,6 +3475,27 @@ git add -A
 git commit -m "Release v2.4.0: ATDPN CAN/ISO protocol-aware DTC parser, ATAL long frames, UDS 19 02 fallback, and raw ECU reply display"
 echo [5/5] Pushing to https://github.com/mr03k/motoobd-android10-scanner.git ...
 git push -u origin main --force
+if not errorlevel 1 goto PUSH_OK
+echo.
+echo [RETRY] Direct port 443 failed. Checking Windows system proxy...
+for /f "tokens=3" %%P in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer 2^>nul ^| findstr ProxyServer') do set WINPROXY=%%P
+if defined WINPROXY (
+    echo [RETRY] Found Windows proxy %WINPROXY% - retrying git push via proxy...
+    git -c http.proxy=http://%WINPROXY% -c https.proxy=http://%WINPROXY% push -u origin main --force
+    if not errorlevel 1 goto PUSH_OK
+)
+echo [RETRY] Trying Windows Schannel SSL backend...
+git -c http.sslBackend=schannel push -u origin main --force
+if not errorlevel 1 goto PUSH_OK
+echo.
+echo ============================================================================
+echo  [ERROR] git push could not reach github.com:443.
+echo  Check your VPN/proxy or upload the extracted files directly on GitHub:
+echo  https://github.com/mr03k/motoobd-android10-scanner/upload/main
+echo ============================================================================
+pause
+exit /b 1
+:PUSH_OK
 echo.
 echo ============================================================================
 echo  SUCCESS! Open https://github.com/mr03k/motoobd-android10-scanner/actions
